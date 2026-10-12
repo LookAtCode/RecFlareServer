@@ -274,6 +274,13 @@ export const PartyChatThread = z.object({
 	ClubId: z.int().nullable().describe('Always null here — this worker serves no club threads'),
 })
 
+/** 2026 reads a thread list; older clients read a thread or an empty object. */
+export const PartyChatReadResponse = z.union([
+	PartyChatThread,
+	z.array(PartyChatThread),
+	z.object({}).strict(),
+])
+
 /**
  * `POST /thread/party` — the client's CreatePartyChat. A bare two-key wrapper, PascalCase
  * like the thread inside it, with no `{ success, error, value }` envelope around it.

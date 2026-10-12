@@ -50,10 +50,10 @@ function b64url(input: ArrayBuffer | string): string {
 	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
-async function bearer(sub: number): Promise<Record<string, string>> {
+async function bearer(sub: number, version?: string): Promise<Record<string, string>> {
 	const now = Math.floor(Date.now() / 1000)
 	const signingInput = `${b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))}.${b64url(
-		JSON.stringify({ sub: String(sub), exp: now + 3600 })
+		JSON.stringify({ sub: String(sub), exp: now + 3600, 'rn.ver': version })
 	)}`
 	const key = await crypto.subtle.importKey(
 		'raw',
@@ -74,6 +74,18 @@ beforeAll(async () => {
 })
 
 describe('chat endpoints', () => {
+	it('2026 party reads return a list, including when the caller has no party', async () => {
+		const empty = await SELF.fetch(`${ORIGIN}/thread/party`, {
+			headers: await bearer(42601, '20260323.14'),
+		})
+		expect(empty.status).toBe(200)
+		expect(await empty.json()).toEqual([])
+		const threadId = await createThread(env.DB, [42601], null, undefined, ChatThreadType.Party)
+		const present = await SELF.fetch(`${ORIGIN}/thread/party`, {
+			headers: await bearer(42601, '20260323.14'),
+		})
+		expect(await present.json()).toMatchObject([{ ChatThreadId: threadId }])
+	})
 	it('GET / reports service status', async () => {
 		const res = await SELF.fetch(`${ORIGIN}/`)
 		expect(res.status).toBe(200)

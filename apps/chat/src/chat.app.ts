@@ -4,7 +4,7 @@ import { useWorkersLogger } from 'workers-tagged-logger'
 
 import { mergePlayerSettings as mergeStoredPlayerSettings, readPlayerSettings } from '@repo/domain'
 import { logger, withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
-import { validateAndGetAccountId } from '@repo/jwt'
+import { validateAndGetAccountId, validateAndGetVersion } from '@repo/jwt'
 
 import { censorSwears } from '../../api/src/sanitize'
 import { NotificationType } from '../../notify/src/notification-types'
@@ -25,7 +25,7 @@ import {
 	json,
 	messageCountParam,
 	NOT_A_MEMBER_RESPONSE,
-	PartyChatThread,
+	PartyChatReadResponse,
 	PartyInviteSettings,
 	RenameThreadRequest,
 	SendMessageRequest,
@@ -891,7 +891,10 @@ const app = new Hono<App>()
 				},
 			],
 			responses: {
-				200: json(PartyChatThread, 'The caller’s party, or `{}` when they have none'),
+				200: json(
+					PartyChatReadResponse,
+					'2026: a list of party threads; older builds: a thread or {}'
+				),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
@@ -900,19 +903,22 @@ const app = new Hono<App>()
 			if (id === null) return c.body(null, 401)
 
 			// Path 1: already in a party. One query, no settings read.
+			const version = await validateAndGetVersion(c.req.raw, await c.env.JWT_SECRET.get())
+			const listResponse = version !== null && version >= '20260323'
+			const noParty = () => (listResponse ? c.json([]) : c.json({}))
 			let thread = await getPartyThreadForPlayer(c.env.DB, id)
 
 			// Path 2: not in one — the key is the only thing that can name a party to join.
 			if (thread === null) {
 				const chatThreadId = await readLatestPartyChatId(c.env, id)
-				if (chatThreadId === null) return c.json({})
+				if (chatThreadId === null) return noParty()
 
 				// Checked BEFORE the join: a gone thread, one of some other type, or a party
 				// too old to still be taking people isn't something to put anybody on —
 				// whoever wrote the key.
 				const meta = await getThreadMeta(c.env.DB, chatThreadId)
-				if (meta === null || meta.chatThreadType !== ChatThreadType.Party) return c.json({})
-				if (!isPartyJoinable(meta.createdAt)) return c.json({})
+				if (meta === null || meta.chatThreadType !== ChatThreadType.Party) return noParty()
+				if (!isPartyJoinable(meta.createdAt)) return noParty()
 
 				await addThreadMember(c.env.DB, chatThreadId, id)
 				// The same announcement the add-member route makes: the party learns someone
@@ -925,7 +931,8 @@ const app = new Hono<App>()
 			const messages = await getThreadMessages(c.env.DB, thread.chatThreadId, {
 				limit: DEFAULT_THREAD_MESSAGE_COUNT,
 			})
-			return c.json(toPartyChatThread(thread, messages))
+			const party = toPartyChatThread(thread, messages)
+			return listResponse ? c.json([party]) : c.json(party)
 		}
 	)
 
