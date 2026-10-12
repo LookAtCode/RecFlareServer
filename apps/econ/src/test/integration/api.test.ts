@@ -3338,6 +3338,14 @@ describe('econ endpoints', () => {
 		expect(await shop(92)).toEqual([])
 	})
 
+	test('2026 room-offer purchase counts use the captured result envelope', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/econ/roomOffer/room/92/purchaseCounts`, {
+			headers: await bearer('42', undefined, '20260323.14'),
+		})
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ Value: [], Success: true, Error: null, error_id: null })
+	})
+
 	test('POST /api/ugcPurchasables/v1/items/bulk resolves custom avatar items, echoing RoomId', async () => {
 		const item = await createCustomAvatarItem(env.DB, {
 			customAvatarItemId: crypto.randomUUID(),
@@ -3703,6 +3711,24 @@ describe('econ endpoints', () => {
 			headers: await bearer(),
 		})
 		expect(bad.status).toBe(400)
+	})
+
+	test('2026 owned built-in consumables include the definition identity flag', async () => {
+		await grantConsumable(env.DB, 9731, 'test-built-in', 3)
+		try {
+			for (const version of ['20260323.14', '20250718.01']) {
+				const res = await exports.default.fetch(`${ORIGIN}/api/consumables/v2/getUnlocked`, {
+					headers: await bearer('9731', undefined, version),
+				})
+				expect(res.status).toBe(200)
+				const [item] = (await res.json()) as Array<Record<string, unknown>>
+				expect(item.Count).toBe(3)
+				if (version === '20260323.14') expect(item.IsRRO).toBe(true)
+				else expect(item).not.toHaveProperty('IsRRO')
+			}
+		} finally {
+			await env.DB.prepare('DELETE FROM consumable WHERE account_id = ?').bind(9731).run()
+		}
 	})
 
 	test('GET /api/consumables/v2/getUnlocked 401s without a token, returns []', async () => {
@@ -8254,5 +8280,20 @@ describe('discord role gift', () => {
 		expect(await tokens(9323)).toBe(DEFAULT_STARTING_TOKENS + 10000)
 		expect(await getPendingGifts(env.DB, 9321)).toHaveLength(2)
 		expect(await getPendingGifts(env.DB, 9322)).toHaveLength(1)
+	})
+})
+
+test('2026 current subscription season supplies a nonempty disabled-season DTO', async () => {
+	const res = await exports.default.fetch(`${ORIGIN}/api/subscriptionseasons/v1/seasons/current`, {
+		headers: await bearer('42', undefined, '20260323.14'),
+	})
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({
+		SubscriptionSeasonId: '00000000-0000-0000-0000-000000000000',
+		Name: '',
+		ImageName: '',
+		StartAt: '0001-01-01T00:00:00Z',
+		NextSeasonStart: null,
+		Milestones: [],
 	})
 })

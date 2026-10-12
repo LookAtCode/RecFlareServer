@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import { describeRoute, openAPIRouteHandler } from 'hono-openapi'
 import { useWorkersLogger } from 'workers-tagged-logger'
+import { z } from 'zod'
 
 import {
 	addXp,
@@ -4720,8 +4721,30 @@ const app = new Hono<App>({ strict: false })
 	)
 	.get(
 		'/econ/roomOffer/room/:roomId/purchaseCounts',
-		listRoute('Per-offer purchase counts for a room', 'Empty stub'),
-		(c) => c.json([])
+		describeRoute({
+			summary: 'Per-offer purchase counts for a room',
+			responses: {
+				200: json(
+					z.union([
+						JsonArray,
+						z.object({
+							Value: JsonArray,
+							Success: z.boolean(),
+							Error: z.string().nullable(),
+							error_id: z.string().nullable(),
+						}),
+					]),
+					'2026: RecNet result envelope; older builds: a list'
+				),
+			},
+		}),
+		async (c) => {
+			if (((await authedBuild(c)) ?? 0) >= 20260323) {
+				// The 2026 client decodes RecNetResultListObject<RoomOfferPurchaseCountDTO>.
+				return c.json({ Value: [], Success: true, Error: null, error_id: null })
+			}
+			return c.json([])
+		}
 	)
 	.get(
 		'/econ/roomGiftDropShops/room/:roomId',
@@ -4901,7 +4924,14 @@ const app = new Hono<App>({ strict: false })
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
-			return c.json(await getConsumables(c.env.DB, id))
+			const consumables = await getConsumables(c.env.DB, id)
+			// These rows are purchases of built-in store items. The 2026 client
+			// includes this flag in the instance key and verifies it against the definition.
+			return c.json(
+				((await authedBuild(c)) ?? 0) >= 20260323
+					? consumables.map((item) => ({ ...item, IsRRO: true }))
+					: consumables
+			)
 		}
 	)
 
@@ -6638,13 +6668,41 @@ const app = new Hono<App>({ strict: false })
 		}
 	)
 
-	// The subscription seasons running right now (the RR+ seasonal reward tracks). Nothing
-	// here runs a season, so this is an empty-list stub — the client reads it as "no season
-	// in progress" and skips the seasonal UI, where a 404 stalls the RR+ page load.
+	// The 2026 decoder requires an object; RecNet rejects JSON null as an empty response.
 	.get(
 		'/api/subscriptionseasons/v1/seasons/current',
-		listRoute('Current subscription seasons', 'Empty stub — no RR+ season is running'),
-		(c) => c.json([])
+		describeRoute({
+			summary: 'Current subscription season',
+			responses: {
+				200: json(
+					z.union([
+						JsonArray,
+						z.object({
+							SubscriptionSeasonId: z.string().uuid(),
+							Name: z.string(),
+							ImageName: z.string(),
+							StartAt: z.string(),
+							NextSeasonStart: z.string().nullable(),
+							Milestones: JsonArray,
+						}),
+					]),
+					'2026: season object without milestones; older builds: []'
+				),
+			},
+		}),
+		async (c) =>
+			c.json(
+				((await authedBuild(c)) ?? 0) >= 20260323
+					? {
+							SubscriptionSeasonId: '00000000-0000-0000-0000-000000000000',
+							Name: '',
+							ImageName: '',
+							StartAt: '0001-01-01T00:00:00Z',
+							NextSeasonStart: null,
+							Milestones: [],
+						}
+					: []
+			)
 	)
 
 	// Whether the caller can start a Maker AI free trial. Always false, mirroring the
