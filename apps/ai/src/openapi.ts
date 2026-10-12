@@ -71,22 +71,23 @@ export const HealthResponse = z.object({
 
 /**
  * The Roomie AI access envelope — the `{ success, error_id, error, value }` shape, unlike
- * the flat Game AI refusal above. Roomie is granted here, with its energy budget pinned at
- * the maximum a signed 32-bit int holds (see INT32_MAX).
+ * the flat Game AI refusal above. 2026 uses the no-credit fallback with zero energy;
+ * older builds retain their full signed-32-bit budget and recharge field.
  */
 export const RoomieAiAccess = z.object({
-	success: z.literal(true),
-	error_id: z.null(),
-	error: z.null(),
+	success: z.boolean(),
+	error_id: z.string().nullable(),
+	error: z.string().nullable(),
 	value: z.object({
 		MaxEnergyFromSubscriptions: z
 			.int()
-			.describe('The energy ceiling a subscription buys — pinned to int32 max'),
-		EnergyLeft: z.int().describe('Energy remaining. Never spent here, so also int32 max'),
+			.describe('Zero for the 2026 companion; int32 max for older builds'),
+		EnergyLeft: z.int().describe('Zero for the 2026 companion; int32 max for older builds'),
 		NextSubscriptionEnergyRechargeAt: z
 			.string()
 			.nullable()
-			.describe('When the budget refills. Null — nothing depletes, so nothing recharges'),
+			.optional()
+			.describe('Null on older builds; omitted for the 2026 DTO'),
 		OutputAudioEnabled: z.boolean().describe('Whether Roomie may speak its replies'),
 	}),
 })

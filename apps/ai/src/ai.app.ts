@@ -3,7 +3,7 @@ import { describeRoute, openAPIRouteHandler } from 'hono-openapi'
 import { useWorkersLogger } from 'workers-tagged-logger'
 
 import { withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
-import { validateAndGetAccountId } from '@repo/jwt'
+import { validateAndGetAccountId, validateAndGetVersion } from '@repo/jwt'
 
 import {
 	AUTHED,
@@ -34,8 +34,8 @@ import type { App } from './context'
  *
  * - Game AI is a SERVER-side feature. This server cannot provide it, so both its reads are
  *   refused and the client hides the feature.
- * - Roomie runs on the CLIENT and only asks this service what it may spend, so the budget
- *   reads are granted in full. The session that would actually reach a model
+ * - Roomie's native 2026 companion gets zero energy and no generated output audio;
+ *   older clients keep the full budget. The session that would actually reach a model
  *   (`/realtime-session/create`) is where it stops.
  * - Maker AI meters model usage in dollars. Nothing here bills, so every figure is zero.
  */
@@ -163,32 +163,47 @@ const app = new Hono<App>()
 		}
 	)
 
-	// Roomie AI's energy budget. Granted, unlike Game AI above: Roomie runs on the client
-	// and only asks this service how much energy it has, so the honest answer for a server
-	// that meters nothing is "as much as you can count".
+	// 20260323.14 has native low-energy and no-energy companion support. Advertising
+	// full energy selects a conversation backend we do not provide. Grant access with
+	// zero energy and the client's recognized no-credit result instead. A successful
+	// access response still opens a realtime session even when its energy is zero.
+	// Preserve the older client's budget and recharge-field contract.
 	.get(
 		'/roomieai/user/access',
 		describeRoute({
 			tags: ['Roomie AI', '2025'],
 			summary: 'The caller’s Roomie AI energy budget',
 			description: [
-				'What Roomie may spend: an energy ceiling, what is left of it, and when it next',
-				'refills. Nothing here meters energy, so the budget is `int.MaxValue` and never',
-				'depletes — which is why `NextSubscriptionEnergyRechargeAt` is null, there being no',
-				'spend to recharge from.',
+				'20260323.14 receives the recognized no-credit result and zero energy for its native',
+				'companion mode. Its DTO has no recharge field. Older clients retain the full',
+				'int32-max budget and null recharge time. No model session is created.',
 				'',
 				'The envelope is `{ success, error_id, error, value }`, NOT the flat body the Game AI',
 				'check answers with. The two are different shapes on purpose — don’t unify them.',
 			].join(' '),
 			security: AUTHED,
 			responses: {
-				200: json(RoomieAiAccess, 'The energy budget — always granted, always full'),
+				200: json(RoomieAiAccess, 'Build-specific conversation access and companion fallback'),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
+
+			const version = await validateAndGetVersion(c.req.raw, await c.env.JWT_SECRET.get())
+			if (version === '20260323.14') {
+				return c.json({
+					success: false,
+					error_id: 'AI.InsufficientRoomieAICreditNoSub',
+					error: 'AI conversation is disabled. Roomie companion mode is available.',
+					value: {
+						MaxEnergyFromSubscriptions: 0,
+						EnergyLeft: 0,
+						OutputAudioEnabled: false,
+					},
+				})
+			}
 
 			return c.json({
 				success: true,
@@ -389,7 +404,7 @@ app.get(
 						'refusals, because the features fail at different points. Game AI is a server-side',
 						'feature this server cannot provide, so both its reads refuse. Roomie and Maker AI',
 						'only ask what the caller may SPEND, which nothing here meters, so those reads are',
-						'granted in full; the refusal lands instead on `POST /realtime-session/create`, the',
+						'granted with a build-specific budget; conversation refuses on `POST /realtime-session/create`, the',
 						'one call whose real answer is a working credential rather than a description of one.',
 						'',
 						'The refusals are 200s carrying `success: false`, which is the shape the client',

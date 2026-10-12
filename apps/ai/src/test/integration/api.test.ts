@@ -27,10 +27,10 @@ function b64url(input: ArrayBuffer | string): string {
 	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
-async function bearer(sub = '42'): Promise<Record<string, string>> {
+async function bearer(sub = '42', version?: string): Promise<Record<string, string>> {
 	const now = Math.floor(Date.now() / 1000)
 	const signingInput = `${b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))}.${b64url(
-		JSON.stringify({ sub, exp: now + 3600 })
+		JSON.stringify({ sub, exp: now + 3600, 'rn.ver': version })
 	)}`
 	const key = await crypto.subtle.importKey(
 		'raw',
@@ -96,6 +96,35 @@ describe('GET /gameai/user/access', () => {
 })
 
 describe('GET /roomieai/user/access', () => {
+	it('selects the 2026 no-credit companion fallback without model credentials', async () => {
+		const headers = await bearer('42', '20260323.14')
+		const res = await SELF.fetch(`${ORIGIN}/roomieai/user/access`, { headers })
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({
+			success: false,
+			error_id: 'AI.InsufficientRoomieAICreditNoSub',
+			error: 'AI conversation is disabled. Roomie companion mode is available.',
+			value: { MaxEnergyFromSubscriptions: 0, EnergyLeft: 0, OutputAudioEnabled: false },
+		})
+		// Entitlement to local activities must never mint a model credential.
+		const session = await SELF.fetch(`${ORIGIN}/realtime-session/create`, {
+			method: 'POST',
+			headers: { ...headers, 'Content-Type': 'application/json' },
+			body: JSON.stringify({ AIType: 'Roomie' }),
+		})
+		expect(session.status).toBe(200)
+		expect(await session.json()).toMatchObject({ success: false, value: null })
+	})
+
+	it('preserves the older build budget', async () => {
+		const res = await SELF.fetch(`${ORIGIN}/roomieai/user/access`, {
+			headers: await bearer('42', '20250718.01'),
+		})
+		expect(await res.json()).toMatchObject({
+			value: { EnergyLeft: 2147483647, OutputAudioEnabled: true },
+		})
+	})
+
 	// Granted, unlike the Game AI check: Roomie runs on the client and only asks for its
 	// energy budget, which nothing here meters.
 	it('grants an int32-max energy budget', async () => {
