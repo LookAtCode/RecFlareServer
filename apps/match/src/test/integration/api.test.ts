@@ -1615,7 +1615,7 @@ describe('auth-gated endpoints', () => {
 		}
 	})
 
-	test('a sandbox account is served out of the sandbox Tachyon pool', async () => {
+	test('a sandbox account is served out of the sandbox Tachyon pool, a rollout build out of the rollout one', async () => {
 		// Sandbox accounts run against their own Tachyon servers, so the whole pool is swapped
 		// for them; selection inside it is the same instance-id round-robin as the live pool.
 		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
@@ -1623,6 +1623,7 @@ describe('auth-gated endpoints', () => {
 			.run()
 		const original = env.TACHYON_HOST_PORT
 		const originalSandbox = env.TACHYON_HOST_PORT_SANDBOX
+		const originalRollout = env.TACHYON_HOST_PORT_ROLLOUT
 		try {
 			env.TACHYON_HOST_PORT = '198.51.100.12:7777'
 			env.TACHYON_HOST_PORT_SANDBOX = '203.0.113.30:7777, 203.0.113.30:7778'
@@ -1667,6 +1668,67 @@ describe('auth-gated endpoints', () => {
 			// In no instance there is no server, sandbox or not.
 			expect(await voiceFor('974')).toEqual({ voiceConnectionInfo: '', voiceServerId: '' })
 
+			// A caller on a build under staged rollout gets the ROLLOUT pool, a third list with
+			// its own ids, read off the token's rn.ver. A sandbox account on that build still
+			// gets the sandbox pool: sandbox wins.
+			env.TACHYON_HOST_PORT_ROLLOUT = '198.51.100.13:7777,198.51.100.13:7778'
+			const rolloutPool = [
+				{ voiceConnectionInfo: '198.51.100.13:7777', voiceServerId: 'rollout-1' },
+				{ voiceConnectionInfo: '198.51.100.13:7778', voiceServerId: 'rollout-2' },
+			]
+			const rolloutVoiceFor = async (player: string, version: string, roomInstanceId: number) => {
+				const res = await exports.default.fetch(
+					`${ORIGIN}/player/connection-info?roomInstanceId=${roomInstanceId}`,
+					{ headers: await bearer(player, version) }
+				)
+				const body = (await res.json()) as {
+					value: { voiceConnectionInfo: string; voiceServerId: string }
+				}
+				return {
+					voiceConnectionInfo: body.value.voiceConnectionInfo,
+					voiceServerId: body.value.voiceServerId,
+				}
+			}
+			for (const photonRoomId of ['tachyon-rollout-a', 'tachyon-rollout-b']) {
+				const rollout = await createRoomInstance(env.DB, {
+					ownerAccountId: 976,
+					roomId: 2,
+					photonRoomId,
+					maxCapacity: 12,
+				})
+				expect(await rolloutVoiceFor('976', '20260323.14', rollout.roomInstanceId)).toEqual(
+					rolloutPool[rollout.roomInstanceId % rolloutPool.length]
+				)
+				expect(await rolloutVoiceFor('974', '20260323.14', rollout.roomInstanceId)).toEqual(
+					sandboxPool[rollout.roomInstanceId % sandboxPool.length]
+				)
+				// Released builds — the default, the beta, and a token carrying no build — stay live.
+				for (const version of [GAME_VERSION, '20250718.01']) {
+					expect(await rolloutVoiceFor('976', version, rollout.roomInstanceId)).toEqual({
+						voiceConnectionInfo: '198.51.100.12:7777',
+						voiceServerId: 'tachyon-1',
+					})
+				}
+				expect(await voiceFor('976', rollout.roomInstanceId)).toEqual({
+					voiceConnectionInfo: '198.51.100.12:7777',
+					voiceServerId: 'tachyon-1',
+				})
+			}
+
+			// With no rollout pool configured, a rollout build falls back to the live one, not
+			// the sandbox one.
+			env.TACHYON_HOST_PORT_ROLLOUT = undefined
+			const unsetRollout = await createRoomInstance(env.DB, {
+				ownerAccountId: 976,
+				roomId: 2,
+				photonRoomId: 'tachyon-rollout-unset',
+				maxCapacity: 12,
+			})
+			expect(await rolloutVoiceFor('976', '20260323.14', unsetRollout.roomInstanceId)).toEqual({
+				voiceConnectionInfo: '198.51.100.12:7777',
+				voiceServerId: 'tachyon-1',
+			})
+
 			// With no sandbox pool configured, a sandbox account falls back to the live one.
 			env.TACHYON_HOST_PORT_SANDBOX = undefined
 			const instance = await createRoomInstance(env.DB, {
@@ -1682,6 +1744,7 @@ describe('auth-gated endpoints', () => {
 		} finally {
 			env.TACHYON_HOST_PORT = original
 			env.TACHYON_HOST_PORT_SANDBOX = originalSandbox
+			env.TACHYON_HOST_PORT_ROLLOUT = originalRollout
 		}
 	})
 

@@ -62,6 +62,26 @@ export function isSupportedGameVersion(version: string | null | undefined): bool
 	return version != null && SUPPORTED_GAME_VERSIONS.includes(version)
 }
 
+/**
+ * Supported builds under STAGED ROLLOUT to Discord supporters — kept apart from the live
+ * side of the stack:
+ *
+ * - `auth` refuses `/connect/token` on one of these unless the account's Discord link
+ *   holds a role in `DISCORD_ROLLOUT_ROLE_IDS` (closed to everyone when none is set).
+ * - `match` hands `GET /player/connection-info` the `TACHYON_HOST_PORT_ROLLOUT` pool for a
+ *   caller whose token's `rn.ver` is one of these (a sandbox account keeps its sandbox
+ *   pool) — the new build runs against its own voice servers, apart from the live pool.
+ *
+ * One list so the two gates can't drift: a build is either rolling out or it isn't. Remove a
+ * build from here when it ships to everyone.
+ */
+export const ROLLOUT_GAME_VERSIONS: readonly string[] = ['20260323.14']
+
+/** Whether a build (a token's `rn.ver`, a grant's posted `ver`) is one under staged rollout. */
+export function isRolloutGameVersion(version: string | null | undefined): boolean {
+	return version != null && ROLLOUT_GAME_VERSIONS.includes(version)
+}
+
 /** Schema DDL (mirror of migrations/0006_presence.sql). */
 export const PRESENCE_SCHEMA_DDL: string[] = [
 	`CREATE TABLE IF NOT EXISTS presence (

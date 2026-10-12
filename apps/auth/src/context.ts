@@ -50,6 +50,20 @@ export type Env = SharedHonoEnv & {
 	 */
 	BAN_EVASION_MATCH?: string
 	/**
+	 * The Discord role ids that may sign in on a ROLLOUT-GATED client build (see
+	 * `ROLLOUT_GAME_VERSIONS` in @repo/domain) — numeric snowflakes, separated by commas
+	 * and/or whitespace, exactly like `www`'s DISCORD_BENEFITS_ROLE_IDS. ANY one of them
+	 * qualifies. A login whose posted `ver` is a gated build is refused unless the account's
+	 * Discord link (`platform_account`, platform 101, written by the website's benefits
+	 * claim) records one of these roles.
+	 *
+	 * Unset — or parsing to no ids — leaves the gate CLOSED: nobody gets a token on a gated
+	 * build. That is the safe reading of "supporters only" when no supporter role has been
+	 * named, and it keeps a build that isn't ready from being reachable by accident.
+	 * Logins on every other build are never touched by this.
+	 */
+	DISCORD_ROLLOUT_ROLE_IDS?: string
+	/**
 	 * Base domain, e.g. `recflare.net`. Injected for every worker at deploy time
 	 * (`--var DOMAIN`). Studio's device-login response points the browser at
 	 * `www.<domain>/device`, so auth has to know the same domain `ns` advertises.

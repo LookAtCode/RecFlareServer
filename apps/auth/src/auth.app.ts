@@ -14,6 +14,7 @@ import {
 	getPasswordHash,
 	getRoomById,
 	hashPassword,
+	isRolloutGameVersion,
 	RoomInstanceType,
 	setLastLoginTime,
 	setLoginContext,
@@ -62,6 +63,7 @@ import {
 } from './openapi'
 import {
 	countAccountsForPlatformIdentity,
+	getLinksForAccount,
 	getLinksForPlatformId,
 	getLinksForPlatformIdentity,
 	isPlatformIdentityLinked,
@@ -171,6 +173,61 @@ const DEFAULT_MAX_ACCOUNTS_PER_DEVICE_ID = 3
  */
 const DEFAULT_PASSWORD_SIGNUP = false
 const PASSWORD_SIGNUP_DISABLED_DESCRIPTION = 'password signup is disabled'
+
+/**
+ * The rollout gate. A `/connect/token` grant posting a build under staged rollout as `ver`
+ * (`ROLLOUT_GAME_VERSIONS` in @repo/domain — shared with `match`, which serves those builds
+ * the sandbox Tachyon pool) is refused unless the account's Discord link holds a role named
+ * in `DISCORD_ROLLOUT_ROLE_IDS` (see context.ts and `accountHoldsRolloutRole`). Every other
+ * build, and a grant posting no `ver` (a refresh, the website), is untouched.
+ *
+ * `ver` is client-reported and unverified, like everything else about the build. That is
+ * fine for what this is: a rollout gate, not a security boundary. A player who lies about
+ * their build gets a token the 2023 server surfaces would have handed them anyway, and
+ * `api`'s `/api/versioncheck/v4` is still what decides which builds are supported at all.
+ *
+ * Refused as `invalid_grant` with ROLLOUT_GATED_DESCRIPTION. `create_account` is refused
+ * before anything is minted: a brand-new account has no Discord link to hold a role, so
+ * the player makes their account on a released build, links Discord on the website, and
+ * comes back.
+ */
+const ROLLOUT_GATED_DESCRIPTION =
+	'this build is limited to Discord supporters; link your Discord on the website first'
+
+/**
+ * `DISCORD_ROLLOUT_ROLE_IDS` as a list of role ids: snowflakes separated by commas and/or
+ * whitespace (the same grammar `www`'s parseRoleIds reads DISCORD_BENEFITS_ROLE_IDS with).
+ * Unset or blank parses to an empty list, which `accountHoldsRolloutRole` treats as a
+ * closed gate.
+ */
+function rolloutRoleIds(raw: string | undefined): string[] {
+	return (raw ?? '')
+		.split(/[\s,]+/)
+		.map((id) => id.trim())
+		.filter((id) => id !== '')
+}
+
+/**
+ * Whether an account may sign in on a rollout-gated build: its Discord link (platform 101,
+ * written by the website's benefits claim and refreshed by `www`'s daily sweep) records at
+ * least one of the configured roles. The roles are a SNAPSHOT (see PlatformLink.roles), so
+ * a role granted in Discord today opens the gate once the player re-claims or the sweep
+ * runs — not instantly.
+ *
+ * An empty role list is answered false without touching the database: with no supporter
+ * role named, nobody is a supporter.
+ */
+async function accountHoldsRolloutRole(
+	db: D1Database,
+	accountId: number,
+	roleIds: readonly string[]
+): Promise<boolean> {
+	if (roleIds.length === 0) return false
+	const links = await getLinksForAccount(db, accountId)
+	return links.some(
+		(link) => link.platform === PlatformType.Discord && link.roles.some((r) => roleIds.includes(r))
+	)
+}
 
 /** New players start in the Orientation room (RoomId 13) — the new-user flow. */
 const ORIENTATION_ROOM_ID = 13
@@ -919,6 +976,14 @@ const app = new Hono<App>()
 				'refused BEFORE it mints anything: making a NEW account to evade with is a different',
 				'act from signing into one. The description is deliberately vague — the signup',
 				'refused may belong to a housemate of the banned player rather than to them.',
+				'',
+				'**Rollout gate.** A grant whose `ver` names a build under staged rollout',
+				'(`ROLLOUT_GAME_VERSIONS`, currently `20260323.14`) is refused as `invalid_grant` "this build is limited to',
+				'Discord supporters" unless the account’s Discord link (made by the website’s',
+				'benefits claim) holds one of the roles in the operator’s `DISCORD_ROLLOUT_ROLE_IDS`.',
+				'With none configured the gate is closed to everyone. `create_account` on such a',
+				'build is refused before it mints anything, since a new account has no Discord link.',
+				'Grants posting no `ver` (a refresh, the website) and every other build are untouched.',
 			].join('\n'),
 			requestBody: form(
 				TokenRequest,
@@ -1113,6 +1178,21 @@ const app = new Hono<App>()
 			//    via create_account or /account/me/changepassword.
 			let accountId: string
 			if (grantType === 'create_account') {
+				// A rollout-gated build can't sign UP: the account it would mint has no Discord
+				// link, so it could never hold the role the gate wants. Refused before anything
+				// is read or minted, like the switch below — no row left behind, no cap slot
+				// burned.
+				if (isRolloutGameVersion(version)) {
+					logger.info('signup refused: build is limited to Discord supporters', {
+						version,
+						ip: clientIp,
+					})
+					return c.json(
+						{ error: 'invalid_grant', error_description: ROLLOUT_GATED_DESCRIPTION },
+						400
+					)
+				}
+
 				// The password-account path (no platform) is a switch, off by default: see
 				// DEFAULT_PASSWORD_SIGNUP. Checked first, before anything is read or minted —
 				// a closed door costs no D1 round trip and burns no cap slot.
@@ -1338,6 +1418,32 @@ const app = new Hono<App>()
 				}
 				await setLastLoginTime(c.env.DB, resolvedId, new Date().toISOString())
 				await setLoginContext(c.env.DB, resolvedId, { deviceId, deviceClass, ip: clientIp })
+			}
+
+			// The rollout gate: a build in ROLLOUT_GATED_VERSIONS is for Discord supporters
+			// only, so the account signing in on it must hold one of the configured roles.
+			// Deliberately AFTER the credential checks, like the ban lookup below — a wrong
+			// password on a gated build is still "invalid account_id or password", so the
+			// gate can't be used to probe whether an account exists. Unlike a ban, this IS a
+			// refusal: there is no block screen to reach, and the client surfaces the
+			// description on its sign-in failure.
+			if (isRolloutGameVersion(version)) {
+				const roleIds = rolloutRoleIds(c.env.DISCORD_ROLLOUT_ROLE_IDS)
+				if (!(await accountHoldsRolloutRole(c.env.DB, Number(accountId), roleIds))) {
+					logger.info('login refused: build is limited to Discord supporters', {
+						accountId,
+						grantType,
+						version,
+						// The COUNT, not the ids: zero here means the gate is closed because
+						// nothing is configured, which reads very differently from "not a
+						// supporter".
+						roleIdCount: roleIds.length,
+					})
+					return c.json(
+						{ error: 'invalid_grant', error_description: ROLLOUT_GATED_DESCRIPTION },
+						400
+					)
+				}
 			}
 
 			// EVERY account gets its token, banned or not — a ban of its own, or a link to

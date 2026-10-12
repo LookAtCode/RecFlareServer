@@ -76,6 +76,14 @@ export type Env = SharedHonoEnv & {
 	 */
 	TACHYON_HOST_PORT_SANDBOX?: string
 	/**
+	 * The Tachyon pool a caller on a build under staged rollout (`ROLLOUT_GAME_VERSIONS` in
+	 * @repo/domain, read off their token's `rn.ver`) is served from
+	 * (`RECFLARE_TACHYON_HOST_PORT_ROLLOUT` in `.env`) — same list format, ids `rollout-1`,
+	 * `rollout-2`, …. A sandbox account is served the sandbox pool even on that build. Unset
+	 * means rollout callers use the live pool. See `tachyonPoolFor` in match.app.ts.
+	 */
+	TACHYON_HOST_PORT_ROLLOUT?: string
+	/**
 	 * The Photon region every session is pinned to — both the region named in the connection
 	 * info and the one stamped on every room instance, which must agree. Optional; unlike the
 	 * app ids this DOES default (`us`, us-east1 in the QoS list), because an instance stamped

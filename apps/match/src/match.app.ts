@@ -38,6 +38,7 @@ import {
 	isClubMember,
 	isMatchmakingPolicy,
 	isPlayerBannedFromRoom,
+	isRolloutGameVersion,
 	MatchmakingErrorCode,
 	MessageType,
 	MOST_ACTIVE_CLUBHOUSE_LIMIT,
@@ -241,23 +242,46 @@ function tachyonServerFor(pool: TachyonServer[], roomInstanceId: number): Tachyo
 /**
  * The prefix of a sandbox server's generated id (see {@link tachyonPoolFor}) — `dev-1`,
  * `dev-2` rather than the live pool's `tachyon-N`, so the (cosmetic) id the client
- * displays says which pool it is on.
+ * displays says which pool it is on. The rollout pool's is `rollout-N` for the same reason.
  */
 const SANDBOX_TACHYON_SERVER_ID_PREFIX = 'dev-'
+const ROLLOUT_TACHYON_SERVER_ID_PREFIX = 'rollout-'
+
+/** What decides which Tachyon pool a caller is served from; see {@link tachyonPoolFor}. */
+interface TachyonCaller {
+	/** The account's `isSandbox` flag. */
+	isSandbox: boolean
+	/** Running a build under staged rollout (`ROLLOUT_GAME_VERSIONS`, off the token's `rn.ver`). */
+	isRollout: boolean
+}
 
 /**
- * The pool the caller's instance is picked out of. A SANDBOX account runs against its own
- * Tachyon servers, apart from the live pool, so the whole list is swapped for
- * `TACHYON_HOST_PORT_SANDBOX` rather than any one entry: selection within it is the same
- * instance-id round-robin {@link tachyonServerFor} applies to the live pool. When that var
- * is unset a sandbox account falls back to the live pool, so an operator who runs no
- * sandbox servers doesn't leave those accounts without voice.
+ * The pool the caller's instance is picked out of — one of three, each the same
+ * comma-separated list, with selection inside it the same instance-id round-robin
+ * {@link tachyonServerFor} applies to all of them:
+ *
+ *  - `TACHYON_HOST_PORT_SANDBOX` for a SANDBOX account, which runs against its own servers
+ *    apart from the live pool;
+ *  - `TACHYON_HOST_PORT_ROLLOUT` for a caller on a build under staged rollout — the build
+ *    `auth` only lets Discord supporters sign in on, which gets its own voice servers while
+ *    it rolls out. Sessions are already split by build ({@link callerGameVersion}), so a
+ *    rollout instance's players are all on that build and all land here together;
+ *  - `TACHYON_HOST_PORT`, the live pool, for everyone else.
+ *
+ * Sandbox wins when both apply: a sandbox account on the rollout build is still a sandbox
+ * account. Either special pool left unset falls back to the live one, so an operator who
+ * runs no sandbox or rollout servers doesn't leave those callers without voice.
  */
-function tachyonPoolFor(env: Env, isSandbox: boolean): TachyonServer[] {
+function tachyonPoolFor(env: Env, caller: TachyonCaller): TachyonServer[] {
 	const sandbox = varOr(env.TACHYON_HOST_PORT_SANDBOX, '')
-	return isSandbox && sandbox.trim() !== ''
-		? tachyonPool(sandbox, SANDBOX_TACHYON_SERVER_ID_PREFIX)
-		: tachyonPool(varOr(env.TACHYON_HOST_PORT, ''))
+	if (caller.isSandbox && sandbox.trim() !== '') {
+		return tachyonPool(sandbox, SANDBOX_TACHYON_SERVER_ID_PREFIX)
+	}
+	const rollout = varOr(env.TACHYON_HOST_PORT_ROLLOUT, '')
+	if (!caller.isSandbox && caller.isRollout && rollout.trim() !== '') {
+		return tachyonPool(rollout, ROLLOUT_TACHYON_SERVER_ID_PREFIX)
+	}
+	return tachyonPool(varOr(env.TACHYON_HOST_PORT, ''))
 }
 
 /**
@@ -3088,8 +3112,11 @@ const app = new Hono<App>()
 				'`TACHYON_HOST_PORT` pool, chosen by instance id so every player in a session is',
 				'handed the same one, with a generated `voiceServerId` (`tachyon-1`, `tachyon-2`,',
 				'…). Both are empty when the pool is unset or the caller is in no instance. A',
-				'sandbox account is picked out of the `TACHYON_HOST_PORT_SANDBOX` pool instead, the same way,',
-				'with ids `dev-1`, `dev-2`, ….',
+				'sandbox account is picked out of the `TACHYON_HOST_PORT_SANDBOX` pool instead, the',
+				'same way, with ids `dev-1`, `dev-2`, …; a caller whose token’s `rn.ver` is a build',
+				'under staged rollout (`ROLLOUT_GAME_VERSIONS`, currently `20260323.14`) out of',
+				'`TACHYON_HOST_PORT_ROLLOUT`, with ids `rollout-1`, `rollout-2`, …. Sandbox wins when',
+				'both apply, and either special pool left unset falls back to the live one.',
 				'`experiments` carries the client’s networking flags.',
 			].join(' '),
 			security: AUTHED,
@@ -3130,9 +3157,13 @@ const app = new Hono<App>()
 			}
 			const account = await getAccount(c.env.DB, id)
 			// The instance's server, the same one every other player in it is handed — except
-			// that a SANDBOX account is picked out of the sandbox pool instead of the live one.
+			// that a SANDBOX account is picked out of the sandbox pool, and a caller on a
+			// rollout build out of the rollout pool, instead of the live one.
 			const tachyon = tachyonServerFor(
-				tachyonPoolFor(c.env, account?.isSandbox === true),
+				tachyonPoolFor(c.env, {
+					isSandbox: account?.isSandbox === true,
+					isRollout: isRolloutGameVersion(await callerVersion(c)),
+				}),
 				roomInstanceId
 			)
 
