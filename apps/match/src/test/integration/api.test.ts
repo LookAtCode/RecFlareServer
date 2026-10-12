@@ -1221,6 +1221,64 @@ describe('public endpoints', () => {
 		}
 	})
 
+	test('visibility changes persist and push the updated own-player cache', async () => {
+		const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+		const headers = await bearer('9200', '20260323.14')
+		await env.DB.prepare(
+			'INSERT INTO relationship (requester_id, target_id, relationship_type) VALUES (9200, 9201, 3)'
+		).run()
+		await setPresence(env.DB, {
+			accountId: 9200,
+			roomInstance: null,
+			statusVisibility: 0,
+			deviceClass: 0,
+			vrMovementMode: 1,
+			platform: 0,
+			appVersion: '20260323.14',
+		})
+		const update = async (body: string, contentType: string) =>
+			exports.default.fetch(`${ORIGIN}/player/statusvisibility`, {
+				method: 'PUT',
+				headers: { ...headers, 'Content-Type': contentType },
+				body,
+			})
+		for (const value of [1, 2, 3, 0]) {
+			expect((await update(JSON.stringify(value), 'application/json')).status).toBe(200)
+			const response = await exports.default.fetch(`${ORIGIN}/player/heartbeat`, {
+				method: 'POST',
+				headers,
+			})
+			expect(await response.json()).toMatchObject({ statusVisibility: value })
+		}
+		await update('statusVisibility=2', 'application/x-www-form-urlencoded')
+		await update('99', 'application/json')
+		const response = await exports.default.fetch(`${ORIGIN}/player/heartbeat`, {
+			method: 'POST',
+			headers,
+		})
+		expect(await response.json()).toMatchObject({ statusVisibility: 2 })
+		const sent = await (
+			await hub().fetch('http://do/all')
+		).json<
+			Array<{
+				playerIds: number[]
+				notificationType: string
+				data: { statusVisibility: number; playerId: number }
+			}>
+		>()
+		expect(sent).toHaveLength(10)
+		expect(sent[8]).toMatchObject({
+			playerIds: [9200],
+			notificationType: 'PresenceUpdate',
+			data: { playerId: 9200, statusVisibility: 2 },
+		})
+		expect(sent[9]).toMatchObject({
+			playerIds: [9201],
+			notificationType: 'PresenceUpdate',
+			data: { playerId: 9200, statusVisibility: 2 },
+		})
+	})
 	test('PUT /player/statusvisibility returns 200', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/player/statusvisibility`, { method: 'PUT' })
 		expect(res.status).toBe(200)

@@ -539,8 +539,8 @@ function redactInstanceForPresence(instance: RoomInstance) {
 /**
  * The SubscriptionUpdatePresence message a friend receives when the player changes rooms:
  * a presence snapshot of who, and the redacted instance they're now in (null when in no
- * room → `isOnline` false). `statusVisibility` is forced to 0 (Everyone) so the player
- * isn't hidden from friends. `appVersion` is the subject's own build (from their presence
+ * room → `isOnline` false). `statusVisibility` follows the saved preference so clients
+ * apply their native visibility rules. `appVersion` is the subject's own build (from their presence
  * row) and MUST be a string — the client's presence DTO reads it with a string reader, and
  * a numeric value aborts the whole SignalR frame ("expected String Begin Token"), dropping
  * the room/presence update.
@@ -548,11 +548,12 @@ function redactInstanceForPresence(instance: RoomInstance) {
 function presenceUpdateMessage(
 	playerId: number,
 	instance: RoomInstance | null,
-	appVersion?: string | null
+	appVersion?: string | null,
+	statusVisibility = 0
 ) {
 	return {
 		playerId,
-		statusVisibility: 0,
+		statusVisibility,
 		deviceClass: 0,
 		vrMovementMode: 0,
 		roomInstance: instance ? redactInstanceForPresence(instance) : null,
@@ -584,7 +585,12 @@ async function notifyFriendsPresence(env: Env, playerId: number): Promise<void> 
 		await env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayersEphemeral(
 			friendIds,
 			NotificationType.SubscriptionUpdatePresence,
-			presenceUpdateMessage(playerId, presence?.roomInstance ?? null, presence?.appVersion)
+			presenceUpdateMessage(
+				playerId,
+				presence?.roomInstance ?? null,
+				presence?.appVersion,
+				presence?.statusVisibility
+			)
 		)
 	} catch (err) {
 		logger.error('failed to push SubscriptionUpdatePresence to friends', {
@@ -2077,15 +2083,41 @@ const app = new Hono<App>()
 		async (c) => {
 			const id = await authedId(c)
 			if (id !== null) {
-				const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>)
+				// Accept native form/query enum values and JSON integrations.
+				const body: unknown = c.req.header('content-type')?.includes('application/json')
+					? await c.req.json().catch(() => null)
+					: await c.req.parseBody().catch(() => null)
+				const value =
+					c.req.query('statusVisibility') ??
+					(body && typeof body === 'object'
+						? ((body as Record<string, unknown>).statusVisibility ??
+							(body as Record<string, unknown>).StatusVisibility)
+						: body)
 				const sv =
-					typeof body.statusVisibility === 'string'
-						? Number.parseInt(body.statusVisibility, 10)
-						: NaN
+					typeof value === 'number'
+						? value
+						: typeof value === 'string' && /^\d+$/.test(value)
+							? Number(value)
+							: NaN
 				const presence = await getPresence<RoomInstance>(c.env.DB, id)
-				if (presence && !Number.isNaN(sv)) {
+				if (presence && Number.isInteger(sv) && sv >= 0 && sv <= 3) {
 					presence.statusVisibility = sv
 					await setPresence(c.env.DB, presence)
+					// The settings menu reads the cached own-player presence. A heartbeat
+					// response alone does not refresh it; publish the native hub update.
+					try {
+						await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayersEphemeral(
+							[id],
+							NotificationType.SubscriptionUpdatePresence,
+							playerPayload(id, presence)
+						)
+					} catch (error) {
+						logger.error('failed to push own visibility update', {
+							playerId: id,
+							error: String(error),
+						})
+					}
+					await notifyFriendsPresence(c.env, id)
 				}
 			}
 			return c.body(null, 200)
