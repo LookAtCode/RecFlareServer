@@ -1138,6 +1138,92 @@ const app = new Hono<App>()
 	.onError(withOnError())
 	.notFound(withNotFound())
 
+	// Studio loaders resolve asset GUIDs before downloading the published bundles.
+	.use('/unity_assets/baked/bulk', async (c, next) => {
+		// Preserve upstream's public form-based Studio resolver. JSON imports need
+		// the caller's presence/ownership before resolving legacy save metadata.
+		if (c.req.method !== 'POST' || !c.req.header('content-type')?.includes('application/json'))
+			return next()
+		const accountId = await authedAccountId(c)
+		if (accountId === null) return unauthorized(c)
+		let body: Record<string, unknown>
+		try {
+			body = await c.req.json<Record<string, unknown>>()
+		} catch {
+			return c.body(null, 400)
+		}
+		if (!body || typeof body !== 'object' || Array.isArray(body)) return c.body(null, 400)
+		const entries = Object.entries(body)
+		const ids = entries.find(([key]) => /^(unityAssetIds|assetIds|ids)$/i.test(key))?.[1]
+		const target = Number(
+			entries.find(([key]) => /^(unityAssetTarget|assetTarget|target)$/i.test(key))?.[1] ?? 0
+		)
+		const version = Number(
+			entries.find(([key]) => /^(unityAssetVersion|assetVersion|version)$/i.test(key))?.[1] ?? 5
+		)
+		if (
+			!Array.isArray(ids) ||
+			ids.length > 128 ||
+			ids.some(
+				(id) => typeof id !== 'string' || !/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id)
+			)
+		) {
+			return c.body(null, 400)
+		}
+		if (!Number.isInteger(target) || !Number.isInteger(version)) return c.body(null, 400)
+		if (ids.length === 0) return c.json([])
+		const requested = new Set(ids.map((id: string) => id.toLowerCase()))
+		const studio = await getBakedUnityAssets(c.env.DB, [...requested], target, version)
+		if (studio.length === requested.size) return c.json(studio)
+		const instance = (await getPresence<PresenceView>(c.env.DB, accountId))?.roomInstance
+		const { results } = await c.env.DB.prepare(
+			`
+			SELECT saves.data FROM subroom_save saves
+			JOIN subroom subs ON subs.current_save_id = saves.sub_room_data_save_id
+			JOIN room rooms ON rooms.room_id = subs.room_id
+			WHERE (rooms.accessibility = 1 OR rooms.creator_account_id = ?1 OR rooms.room_id = ?2)
+			AND (lower(json_extract(saves.data, '$.UnityAssetId')) IN (SELECT value FROM json_each(?3))
+			OR EXISTS (SELECT 1 FROM json_each(saves.data, '$.UnitySubAssets') asset
+				WHERE lower(json_extract(asset.value, '$.UnityAssetId')) IN (SELECT value FROM json_each(?3)))
+			OR EXISTS (SELECT 1 FROM json_each(saves.data, '$.ReferencedUnityAssets') asset
+				WHERE lower(json_extract(asset.value, '$.UnityAssetId')) IN (SELECT value FROM json_each(?3))))
+		`
+		)
+			.bind(accountId, instance?.roomId ?? -1, JSON.stringify([...requested]))
+			.all<{ data: string }>()
+		const assets = new Map<
+			string,
+			{ UnityAssetId: string; Target: number; Version: number; Filename: string; Hash: string }
+		>()
+		for (const asset of studio) assets.set(asset.UnityAssetId.toLowerCase(), asset)
+		for (const row of results) {
+			const save = JSON.parse(row.data) as Record<string, unknown>
+			const candidates = [
+				save,
+				...(Array.isArray(save.UnitySubAssets) ? save.UnitySubAssets : []),
+				...(Array.isArray(save.ReferencedUnityAssets) ? save.ReferencedUnityAssets : []),
+			]
+			for (const candidate of candidates) {
+				if (!candidate || typeof candidate !== 'object') continue
+				const asset = candidate as Record<string, unknown>
+				const id = typeof asset.UnityAssetId === 'string' ? asset.UnityAssetId.toLowerCase() : ''
+				const filename = asset.UnityAsset
+				if (!requested.has(id) || typeof filename !== 'string') continue
+				const build = /\.(\d+)\.(\d+)\.assetbundle$/.exec(filename)
+				if (!build || Number(build[1]) !== target || Number(build[2]) !== version) continue
+				if (assets.has(id)) continue
+				assets.set(id, {
+					UnityAssetId: id,
+					Target: target,
+					Version: version,
+					Filename: filename,
+					Hash: typeof asset.UnityAssetHash === 'string' ? asset.UnityAssetHash : '',
+				})
+			}
+		}
+		return c.json([...requested].flatMap((id) => (assets.has(id) ? [assets.get(id)!] : [])))
+	})
+
 	.get(
 		'/',
 		describeRoute({
@@ -3871,7 +3957,17 @@ const app = new Hono<App>()
 			if (!(await canReadSaves(c, room, roomId, accountId))) return c.body(null, 403)
 
 			const save = await getSubRoomSaveById(c.env.DB, subRoomId, saveId)
-			return save ? c.json(toSaveDetail(save, unityAssetTargetQuery(c))) : c.notFound()
+			if (!save) return c.notFound()
+			const target = unityAssetTargetQuery(c)
+			// Imported pre-Studio saves name their main/dependency bundles directly.
+			// Keep upstream's target-aware Studio projection for its built assets.
+			if (
+				typeof save.UnityAsset === 'string' &&
+				!pickBakedBundle(save, target) &&
+				(target === null || target === 0)
+			)
+				return c.json(save)
+			return c.json(toSaveDetail(save, target))
 		}
 	)
 
