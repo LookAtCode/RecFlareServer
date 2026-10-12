@@ -371,8 +371,16 @@ const app = new Hono<App>()
 	})
 
 	/**
-	 * Redeem a Discord authorization code and, if the player holds the configured role in
-	 * the configured guild, give the account Rec Room Plus.
+	 * Redeem a Discord authorization code, link the Discord identity to the account with the
+	 * roles the player holds in the configured guild, and — if any of those is a configured
+	 * qualifying role — give the account Rec Room Plus.
+	 *
+	 * The LINK is not gated on the roles: any member of the guild is linked, and the whole
+	 * role list is recorded on the link whether or not a qualifying one is among them. The
+	 * roles are read in-game (`auth`'s rollout gate reads them, and the daily sweep keeps
+	 * them fresh), so a member with no supporter role still has a reason to link. Only the
+	 * `hasPlus` grant asks the qualifying question; a claim without a qualifying role
+	 * answers 200 with `hasPlus: false` rather than refusing.
 	 *
 	 * The browser sends ONLY the code. It never sees an access token: the exchange happens
 	 * here with the client secret, the roles are read with the resulting token, and the
@@ -383,9 +391,9 @@ const app = new Hono<App>()
 	 * The claim is once-only PER DISCORD USER, not per account: the Discord id is stored
 	 * beside the flag, and a code from a Discord member who has already claimed elsewhere
 	 * is refused. Otherwise one person with the role could walk it around every account
-	 * they own. Re-claiming on the same account is allowed and simply re-affirms the flag,
-	 * which is what makes the page safe to reload and a lapsed-then-restored role
-	 * re-claimable.
+	 * they own. Re-claiming on the same account is allowed: it refreshes the roles and, if
+	 * a qualifying one is held, re-affirms the flag, which is what makes the page safe to
+	 * reload and a lapsed-then-restored role re-claimable.
 	 *
 	 * Nothing here ever REVOKES Plus: losing the Discord role later leaves the flag set.
 	 * That's deliberate for now — a sweep would need a bot token to enumerate the guild,
@@ -432,18 +440,11 @@ const app = new Hono<App>()
 		if (membership === null) {
 			return c.json({ error: 'You are not a member of our Discord server.' }, 403)
 		}
-		// Any ONE of the configured roles qualifies — see `qualifies`. The message stays
-		// singular-ish and names no role: which roles qualify is the operator's business to
-		// advertise in their own server, and listing them here would leak the guild's role
-		// layout to anyone who pressed the button.
-		if (!qualifies(membership.roles, config.roleIds)) {
-			return c.json({ error: 'Your Discord account does not have a qualifying role.' }, 403)
-		}
 
 		// The once-only guard, asked of the link table: is this Discord identity already on an
 		// account, and is that account someone else's? Re-claiming on the caller's OWN account
-		// is the idempotent case and must fall through — it's how a player whose role lapsed
-		// and came back re-affirms Plus, and it's what makes the page safe to reload.
+		// is the idempotent case and must fall through — it's how a player whose roles changed
+		// refreshes them and re-affirms Plus, and it's what makes the page safe to reload.
 		//
 		// `countAccountsForPlatformIdentity` counts EVERY link for the identity, unfiltered by
 		// platform, which is why the claim can use the same helper `auth`'s per-identity
@@ -479,14 +480,15 @@ const app = new Hono<App>()
 			firstLink = !links.some((link) => link.platform === PlatformType.Discord)
 		}
 
-		// Both writes are idempotent: the link is INSERT OR IGNORE (so `linkedAt` keeps the
-		// FIRST claim's time), and the flag is already true on a re-claim.
+		// The link is written for EVERY guild member, qualifying role or not, and it is
+		// idempotent: INSERT OR IGNORE (so `linkedAt` keeps the FIRST claim's time), with the
+		// roles refreshed on a re-claim.
 		//
 		// The member's roles ride along onto the link's `role` column — the WHOLE list Discord
 		// served, not just the ones that qualified. `hasPlus` records only that a qualifying
-		// role was held; this records which, so an operator can tell a supporter from a
-		// booster from staff without going and asking Discord, and can still read a grant made
-		// under a role that has since been retired from the config. Roles are the one part of
+		// role was held; this records which, so the game can act on any role an operator cares
+		// about (`auth`'s rollout gate reads this list) and an operator can tell a supporter
+		// from a booster from staff without going and asking Discord. Roles are the one part of
 		// the row a re-claim REFRESHES, because they're a snapshot of a membership that moves
 		// and this reading is the fresher one.
 		const created = await linkPlatformIdentity(
@@ -496,8 +498,24 @@ const app = new Hono<App>()
 			membership.userId,
 			membership.roles
 		)
-		await updateAccount(c.env.DB, accountId, { hasPlus: true })
-		logger.info('granted plus from a discord benefits claim', { accountId })
+
+		// Any ONE of the configured roles qualifies — see `qualifies`. Without one, the link
+		// stands and the flag is left exactly as it was: never set, and never REVOKED either —
+		// a player whose role lapsed keeps the Plus they were granted (see the note above).
+		// Which roles qualify is the operator's business to advertise in their own server, so
+		// nothing here names them.
+		let hasPlus: boolean
+		if (qualifies(membership.roles, config.roleIds)) {
+			await updateAccount(c.env.DB, accountId, { hasPlus: true })
+			logger.info('granted plus from a discord benefits claim', { accountId })
+			hasPlus = true
+		} else {
+			hasPlus = (await getAccount(c.env.DB, accountId))?.hasPlus ?? false
+			logger.info('linked a discord without a qualifying role', {
+				accountId,
+				roleCount: membership.roles.length,
+			})
+		}
 
 		// The one-time supporter gift: the box econ's cron would hand this member, paid now,
 		// once. Gated on the insert having happened too (`created`), so two claims racing on
@@ -530,9 +548,16 @@ const app = new Hono<App>()
 			}
 		}
 
-		// The username is echoed for the confirmation line only — it is never stored, and a
-		// Discord member who has since renamed themselves is not a problem to solve here.
-		return c.json({ hasPlus: true, discordUsername: membership.username, tokensAwarded })
+		// `hasPlus` is where the account stands AFTER this claim, so the page can tell "linked
+		// and granted" from "linked, no qualifying role" without a second read. The username
+		// is echoed for the confirmation line only — it is never stored, and a Discord member
+		// who has since renamed themselves is not a problem to solve here.
+		return c.json({
+			hasPlus,
+			linked: true,
+			discordUsername: membership.username,
+			tokensAwarded,
+		})
 	})
 
 	// Whether the signed-in account has studio upload access (`hasStudio`). The page

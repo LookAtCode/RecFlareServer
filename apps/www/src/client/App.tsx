@@ -545,6 +545,12 @@ const fetchBenefitsStatus = (): Promise<BenefitsStatus> =>
 
 /** What a successful claim answers. */
 interface ClaimResult {
+	/**
+	 * Where the account stands after this claim. The Discord is linked and its roles saved
+	 * either way; this is false when none of them is a qualifying role (and the account had
+	 * no Plus from before).
+	 */
+	hasPlus: boolean
 	discordUsername?: string
 	/**
 	 * The supporter gift paid on this claim — the tokens the server hands a linked role once,
@@ -755,17 +761,23 @@ function BenefitsPanel({ account, config }: { account: SelfAccount; config: Site
 		setPending(true)
 		claimBenefits(code)
 			.then((result) => {
-				setStatus({ hasPlus: true, linked: true })
-				const verified = result.discordUsername
-					? `Verified as ${result.discordUsername} — Rec Room Plus is now on your account.`
-					: 'Verified — Rec Room Plus is now on your account.'
+				setStatus({ hasPlus: result.hasPlus, linked: true })
+				const who = result.discordUsername ? ` as ${result.discordUsername}` : ''
+				// Linked either way; whether Plus came with it depends on the roles. Without a
+				// qualifying role the roles are still saved for the game, and that is said
+				// plainly rather than reading as a failure.
+				const verified = result.hasPlus
+					? `Verified${who} — Rec Room Plus is now on your account.`
+					: `Linked${who} — your Discord roles are saved to your account, but none of them currently grants Rec Room Plus.`
 				// The first-link gift, when one was paid: it's sitting in a box in the game, and
 				// the player would otherwise only find it by opening their gifts.
 				const gift = result.tokensAwarded
 					? ` A welcome gift of ${result.tokensAwarded.toLocaleString()} tokens is waiting in your gift boxes.`
 					: ''
 				setDone(verified + gift)
-				setRelogin(true)
+				// The re-login hint is about Plus riding on the game token; without Plus there
+				// is nothing a sign-in would pick up.
+				setRelogin(result.hasPlus)
 			})
 			.catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)))
 			.finally(() => setPending(false))
@@ -783,14 +795,15 @@ function BenefitsPanel({ account, config }: { account: SelfAccount; config: Site
 	}
 
 	const claimed = status?.hasPlus === true
+	const linked = status?.linked === true
 
 	return (
 		<section className="card">
-			<h2>Rec Room Plus</h2>
+			<h2>Link your Discord</h2>
 			<p className="muted">
-				Members of our Discord with a supporter role get Rec Room Plus on their account. Verify with
-				Discord and we’ll check your roles — we only ever read your username and which roles you
-				hold in our server.
+				Link your Discord to carry the roles you hold in our server into the game. Members with a
+				supporter role also get Rec Room Plus on their account. We only ever read your username and
+				which roles you hold in our server.
 			</p>
 			<p className="muted">
 				Claiming as <strong>@{account.username}</strong> (#{account.accountId}). A Discord account
@@ -821,6 +834,21 @@ function BenefitsPanel({ account, config }: { account: SelfAccount; config: Site
 								session your game signed in with.
 							</p>
 						</>
+					)}
+					<button className="linkish" onClick={() => startDiscordAuth(authorizeUrl)}>
+						Re-verify with Discord
+					</button>
+				</>
+			) : linked ? (
+				// Linked, no Plus: a member without a qualifying role, or one who lost it. Their
+				// roles are on the account; re-verifying refreshes them (and grants Plus if a
+				// qualifying role has since been added).
+				<>
+					{!done && (
+						<p className="muted">
+							Your Discord is linked and its roles are saved to this account. None of them currently
+							grants Rec Room Plus.
+						</p>
 					)}
 					<button className="linkish" onClick={() => startDiscordAuth(authorizeUrl)}>
 						Re-verify with Discord

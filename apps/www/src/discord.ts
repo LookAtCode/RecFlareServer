@@ -5,8 +5,10 @@ import type { Env } from './context'
 /**
  * Discord OAuth2, the identity check behind the website's benefits claim.
  *
- * A player proves they hold one of the qualifying roles in the community Discord, and
- * the claim grants them Rec Room Plus (`account.hasPlus`). The proof is a real OAuth2
+ * A player links their Discord to their account: the claim records the roles they hold
+ * in the community Discord on the link (read in-game, e.g. by `auth`'s rollout gate), and
+ * if one of them is a qualifying role it also grants Rec Room Plus (`account.hasPlus`).
+ * The link happens whether or not a qualifying role is held. The proof is a real OAuth2
  * AUTHORIZATION CODE exchange, not a token the browser hands us: the SPA sends only the
  * short-lived `code` Discord redirected it back with, and this worker swaps that for an
  * access token using the client SECRET, which — like the Turnstile secret next door —

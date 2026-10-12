@@ -87,9 +87,13 @@ The tests seed the same pair into their own local store in `beforeAll`.
 
 ### Benefits claim and Discord
 
-The **Claim benefits** tab on the account page lets a player prove they hold one of
-the qualifying roles in the community Discord and, if they do, gives their account Rec
-Room Plus (`account.hasPlus`). The same panel also renders at `/claim`, which is the
+The **Claim benefits** tab on the account page lets a player link their Discord to
+their account. Any member of the community Discord can link: the roles they hold there
+are recorded on the link (`platform_account.role`, which the game reads — `auth`'s
+rollout gate, for one — and `www`'s daily sweep keeps fresh), and if one of them is a
+qualifying role the claim also gives the account Rec Room Plus (`account.hasPlus`). A
+member with no qualifying role is still linked and answered `hasPlus: false`, not
+refused. The same panel also renders at `/claim`, which is the
 app's registered `redirect_uri` — Discord sends the browser back there mid-flow, so
 that route has to keep working on a cold load even though nothing links to it. It runs a standard
 OAuth2 **authorization code** flow:
@@ -102,8 +106,8 @@ OAuth2 **authorization code** flow:
    `POST /api/benefits/claim` with the player's bearer token.
 3. The worker swaps the code for an access token with the client secret, reads
    `GET /users/@me/guilds/{guild}/member` to get the player's roles, revokes the
-   token, and — if any one of the configured roles is there — writes `hasPlus` onto
-   the account and links the Discord id.
+   token, links the Discord id with the full role list, and — if any one of the
+   configured roles is there — writes `hasPlus` onto the account.
 
 **A claim takes effect on the player's next sign-in, not immediately.** `auth` stamps
 `hasPlus` into every token it mints as the `rn.plus` claim, and `econ` decides the
