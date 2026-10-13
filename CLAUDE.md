@@ -287,6 +287,16 @@ inconsistency here without checking the client first.
   other implementations set it at all, it names the start of a voice-chat timeout. Other
   implementations with timed bans keep their set-time private and serve the remainder on
   every read; `banned_at` here is the staff panel's audit trail, not the client's.
+- `unity_asset` holds two kinds of bundle under one shape: Rec Room Studio builds (UGC, the
+  `studio` worker writes them, filenames `studio/<roomId>/…`) and FIRST-PARTY bundles captured
+  from the official game and loaded by hand (`unity/<roomId>/…`). Only the Studio ones may be
+  folded onto `CurrentSave.UnitySubAssets` (`rooms`: `GET /rooms/:id`, the save reads) —
+  `attachStudioUnityAssets` filters on `isStudioBundleFilename`. The 2025 client resolves a
+  first-party bundle through `POST /unity_assets/baked/bulk` (which serves both kinds); handed
+  it inline in the five-key `{ Target, Version, Filename, Hash }` shape it takes that instead,
+  cannot name the file (its decoder wants `UnityAsset`/`UnityAssetHash`), and the room loads
+  nothing. Every imported first-party room broke when the splice moved from the Studio-only
+  table to `unity_asset`, with every response looking correct.
 - Accessibility is sent as the `RoomAccessibility` enum NAME on
   `rooms` `PUT /rooms/:id/subrooms/:sid/accessibility` (`accessibility=Private`), not the
   ordinal the room-level `/rooms/:id/accessibility` takes. The enum has five members

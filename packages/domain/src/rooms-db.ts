@@ -21,6 +21,7 @@ import { bindPlaceholders, chunkForBinds, MAX_BOUND_PARAMS } from './d1-binds'
 import { Accessibility, Role } from './enums'
 import { countPlayersByRoom } from './presence-db'
 import { resyncInstanceCapacity } from './room-instance-db'
+import { isStudioBundleFilename } from './studio-unity-assets'
 import { bakedUnityAssets, listUnityAssetBuilds } from './unity-assets-db'
 
 import type { UnityAssetBuild } from './unity-assets-db'
@@ -2303,6 +2304,14 @@ async function attachCurrentSaves(
  * including their empty arrays; so is a save whose asset has no stored build —
  * the scene blob still loads, and the bundle list stays empty.
  *
+ * Only Studio (UGC) builds are folded in — rows whose filename passes
+ * {@link isStudioBundleFilename}. A FIRST-PARTY bundle loaded by hand under
+ * `unity/<roomId>/` shares the table but must stay out of this list: the 2025 client
+ * resolves it through `POST /unity_assets/baked/bulk` (which serves both kinds), and
+ * handed it inline in this five-key shape it stops asking, cannot name the file, and
+ * loads nothing. That broke every imported first-party room when the splice moved from
+ * the Studio-only table to `unity_asset`.
+ *
  * Only main bundles are listed. Stripped bundles stay in the bucket.
  */
 export async function attachStudioUnityAssets(
@@ -2317,7 +2326,9 @@ export async function attachStudioUnityAssets(
 		),
 	]
 	if (ids.length === 0) return
-	const builds = await listUnityAssetBuilds(db, ids)
+	const builds = (await listUnityAssetBuilds(db, ids)).filter((build) =>
+		isStudioBundleFilename(build.Filename)
+	)
 	// Rows come back with the id lowercased; a save may spell its GUID either way.
 	const byAsset = new Map<string, UnityAssetBuild[]>()
 	for (const build of builds) {

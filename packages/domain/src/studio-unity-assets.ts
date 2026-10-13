@@ -40,6 +40,9 @@ export const STUDIO_ASSET_VERSION = 1
 /** The platforms a local Studio build posts, named as the multipart fields name them. */
 export type StudioBundlePlatform = 'windows' | 'android'
 
+/** Where every Studio (UGC) bundle filename starts; see {@link publicStudioBundleFilename}. */
+const STUDIO_BUNDLE_PREFIX = 'studio/'
+
 /**
  * A Studio bundle's `unity_asset.filename` — the name the client downloads, which it
  * prefixes with `/room/` (see {@link studioBundleR2Key}). Laid out like the official
@@ -54,7 +57,20 @@ export function publicStudioBundleFilename(
 	kind: string
 ): string {
 	const id = unityAssetId.replace(/-/g, '').toLowerCase()
-	return `studio/${roomId}/${id}.${platform}.${kind}.assetbundle`
+	return `${STUDIO_BUNDLE_PREFIX}${roomId}/${id}.${platform}.${kind}.assetbundle`
+}
+
+/**
+ * Whether a `unity_asset` filename is a Rec Room Studio build — UGC the studio worker
+ * wrote — as opposed to a first-party bundle loaded by hand under the game's own
+ * `unity/<roomId>/` layout. The two share the table, and only the Studio ones are
+ * folded onto a save's `UnitySubAssets`: a 2025 client handed a first-party bundle
+ * inline takes it instead of asking `POST /unity_assets/baked/bulk`, cannot name it
+ * (its decoder reads `UnityAsset`/`UnityAssetHash`, not `Filename`/`Hash`), and loads
+ * nothing. The bulk lookup serves both kinds.
+ */
+export function isStudioBundleFilename(filename: string): boolean {
+	return filename.startsWith(STUDIO_BUNDLE_PREFIX)
 }
 
 /**

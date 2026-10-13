@@ -10,8 +10,10 @@
  *
  * Two things read it. The client asks for main bundles in bulk from
  * `POST /unity_assets/baked/bulk` (the `rooms` worker) while loading a room — the step
- * Player.log times as `AssetBundle_Download` — and `GET /rooms/{id}` folds the same main
- * bundles onto `CurrentSave.UnitySubAssets`; either way the client then downloads
+ * Player.log times as `AssetBundle_Download` — and `GET /rooms/{id}` folds the STUDIO
+ * main bundles (filenames under `studio/`, see `isStudioBundleFilename`) onto
+ * `CurrentSave.UnitySubAssets`. A first-party bundle loaded by hand under `unity/<roomId>/`
+ * is served by the bulk lookup only; either way the client then downloads
  * `/room/<Filename>` from the bucket, and a lookup that answers no row,
  * or a row without a `Filename`, simply downloads nothing, with no error anywhere.
  *
