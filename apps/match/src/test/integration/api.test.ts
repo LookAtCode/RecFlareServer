@@ -1351,6 +1351,38 @@ describe('auth-gated endpoints', () => {
 		expect(priv2.roomInstance.roomInstanceId).not.toBe(priv.roomInstance.roomInstanceId)
 	})
 
+	test('POST /matchmake/room/:roomId pools every point release of a build into one instance', async () => {
+		const matchmake = async (sub: string, version: string) =>
+			(await (
+				await exports.default.fetch(`${ORIGIN}/matchmake/room/2`, {
+					method: 'POST',
+					headers: await bearer(sub, version),
+				})
+			).json()) as { roomInstance: { photonRoomId: string; roomInstanceId: number } }
+
+		// The `.NN` after the date is a same-day rebuild of the same build, so a `.01` client,
+		// a `.2` client and one reporting the bare date all belong in one session.
+		const first = await matchmake('9170', '20250718.01')
+		const point = await matchmake('9171', '20250718.2')
+		const bare = await matchmake('9172', '20250718')
+		expect(point.roomInstance.roomInstanceId).toBe(first.roomInstance.roomInstanceId)
+		expect(bare.roomInstance.roomInstanceId).toBe(first.roomInstance.roomInstanceId)
+
+		// The instance is stamped with the BUILD, not the version that opened it — the key
+		// the lookups match on. (The same shape migrations/0028 backfills older rows into.)
+		const row = await env.DB.prepare('SELECT game_version FROM room_instance WHERE id = ?1')
+			.bind(first.roomInstance.roomInstanceId)
+			.first<{ game_version: string }>()
+		expect(row?.game_version).toBe('20250718')
+
+		// The point release doesn't leak into presence: that still reports the version the
+		// client posted, which is what describes the player to their friends.
+		const presence = await env.DB.prepare(
+			'SELECT data FROM presence WHERE account_id = 9171'
+		).first<{ data: string }>()
+		expect(JSON.parse(presence?.data ?? '{}').appVersion).toBe('20250718.2')
+	})
+
 	test('POST /matchmake/room/:roomId only pools players on the same client build', async () => {
 		const matchmake = async (sub: string, version: string) =>
 			(await (
@@ -2651,9 +2683,11 @@ describe('auth-gated endpoints', () => {
 		const older = await spawn('915', '20250424.01')
 		expect(await join(older, '20250718.01')).toEqual(refused(20))
 
-		// Same build → in they go.
+		// Same build → in they go — and a point release IS the same build: the instance holds
+		// the bare date, and the caller's `.2` reduces to it.
 		const same = await spawn('916', '20250718.01')
 		expect(await join(same, '20250718.01')).toMatchObject({ errorCode: 0 })
+		expect(await join(same, '20250718.2')).toMatchObject({ errorCode: 0 })
 	})
 
 	test('POST /matchmake/instance/:id joins that exact instance, owner-only', async () => {

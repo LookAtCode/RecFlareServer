@@ -301,6 +301,18 @@ describe('public endpoints', () => {
 		}
 	})
 
+	test('GET /api/versioncheck/v4 ignores the point release: every .NN of a supported build is current', async () => {
+		// The list holds bare dates; the client reports `YYYYMMDD.NN`, and the `.NN` is a
+		// same-day rebuild of the same build. All of these are the beta build.
+		for (const version of ['20250718.01', '20250718.2', '20250718', '20250718.99']) {
+			const res = await exports.default.fetch(`${ORIGIN}/api/versioncheck/v4?v=${version}`)
+			expect(await res.json(), version).toMatchObject({ VersionStatus: 0 })
+		}
+		// ...and a point release of a build that ISN'T supported is still not.
+		const res = await exports.default.fetch(`${ORIGIN}/api/versioncheck/v4?v=19990101.01`)
+		expect(await res.json()).toMatchObject({ VersionStatus: 1 })
+	})
+
 	test('GET /api/versioncheck/v4 flags a mismatched build', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/versioncheck/v4?v=19990101`)
 		expect(await res.json()).toMatchObject({ VersionStatus: 1 })
@@ -331,6 +343,9 @@ describe('public endpoints', () => {
 
 	test('GET /api/gameconfigs/v1/all serves the 2023 catalog to the target build', async () => {
 		expect(await gameConfigKeys(GAME_VERSION)).not.toContain(KEY_2025_ONLY)
+		// A same-day point release of the target is the target build: compared as a build,
+		// not as a string that happens to sort after `20230414`.
+		expect(await gameConfigKeys(`${GAME_VERSION}.01`)).not.toContain(KEY_2025_ONLY)
 	})
 
 	test('GET /api/gameconfigs/v1/all serves the 2023 catalog to an older build', async () => {

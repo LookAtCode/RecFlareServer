@@ -3,7 +3,7 @@ import { describeRoute } from 'hono-openapi'
 
 import { Accessibility, createNotification, GAME_VERSION, MessageType } from '@repo/domain'
 import { logger } from '@repo/hono-helpers'
-import { validateAndGetVersion } from '@repo/jwt'
+import { validateAndGetBuild } from '@repo/jwt'
 
 // The notification-type ids the hub carries (owned by the `notify` worker). Imported
 // as a value — the enum has no runtime dependencies.
@@ -306,15 +306,16 @@ async function pushEventInvitation(
  * the split is the one `/api/gameconfigs/v1/all` already makes: anything NEWER than
  * `GAME_VERSION` (20230414) gets the pairs; that build, anything older, and a request
  * with no readable token version all get the 2023 names. Builds are date-stamped, so they
- * order as strings. `TagModifyResult.Tags` is a name list to every build — only the
- * inline field moves.
+ * order as strings — compared as BUILDS, with the client's point release dropped, so a
+ * same-day rebuild of the target stays on its side. `TagModifyResult.Tags` is a name list
+ * to every build — only the inline field moves.
  *
  * Like the other version gates here the claim is unverified — a client that lies about its
  * build only empties its own tag chips.
  */
 async function eventResult(c: Context<App>, event: PlayerEvent, tags: EventTag[]) {
-	const version = await validateAndGetVersion(c.req.raw, await c.env.JWT_SECRET.get())
-	const isModernBuild = version !== null && version > GAME_VERSION
+	const build = await validateAndGetBuild(c.req.raw, await c.env.JWT_SECRET.get())
+	const isModernBuild = build !== null && build > GAME_VERSION
 	return toEventResult(event, tags, isModernBuild)
 }
 

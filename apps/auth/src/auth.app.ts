@@ -978,7 +978,7 @@ const app = new Hono<App>()
 				'refused may belong to a housemate of the banned player rather than to them.',
 				'',
 				'**Rollout gate.** A grant whose `ver` names a build under staged rollout',
-				'(`ROLLOUT_GAME_VERSIONS`, currently `20260323.14`) is refused as `invalid_grant` "this build is limited to',
+				'(`ROLLOUT_GAME_VERSIONS`, currently `20260323` — every point release of it) is refused as `invalid_grant` "this build is limited to',
 				'Discord supporters" unless the account’s Discord link (made by the website’s',
 				'benefits claim) holds one of the roles in the operator’s `DISCORD_ROLLOUT_ROLE_IDS`.',
 				'With none configured the gate is closed to everyone. `create_account` on such a',

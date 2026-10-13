@@ -35,31 +35,55 @@ export const PRESENCE_TTL_SECONDS = 900
 export const GAME_VERSION = '20230414'
 
 /**
+ * The BUILD a client version names — the `YYYYMMDD` date of `20250718.01`, `20250718.2`
+ * or `20250718` alike — or null when there is nothing to name (no version, or an empty
+ * one). The `.NN` after the date is a same-day point release: it does not change the
+ * protocol, the scene format or anything else this server keys on, so every build gate
+ * compares builds, not versions, and a point release is served exactly as its date is.
+ *
+ * Versions are still carried VERBATIM where they describe the client to someone — the
+ * token's `rn.ver` and presence's `appVersion` echo what the client posted. Only the
+ * comparisons (and the room-instance key, see `room-instance-db`) go through here.
+ */
+export function gameBuild(version: string | null | undefined): string | null {
+	const build = version?.split('.')[0] ?? ''
+	return build === '' ? null : build
+}
+
+/**
  * Client builds `/api/versioncheck/v4` answers "current" for, in the support tiers the
  * README publishes. They talk close enough to the same protocol to get past the update
  * prompt; how much beyond that is tested differs by tier:
  *
  * - `GAME_VERSION` (`20230414`, manifest `7859140924515540835`) is the DEFAULT — the
  *   build the rest of the stack targets and the one it reports for itself.
- * - `20250718.01` (manifest `1151455856673601091`, reached through the `patch-2025`
- *   patch) is BETA — supported, and the build the "newer than `20230414`" gates in
- *   `econ`/`api`/`rooms` are written and tested against.
+ * - `20250718` (the `20250718.01` client, manifest `1151455856673601091`, reached through
+ *   the `patch-2025` patch) is BETA — supported, and the build the "newer than `20230414`"
+ *   gates in `econ`/`api`/`rooms` are written and tested against.
  * - The rest are ALPHA: waved past the version check, but nothing else in the stack
  *   targets them, so they can still hit protocol differences this check would otherwise
  *   have caught. Expect breakage rather than treating a bug there as a regression.
+ *
+ * Listed WITHOUT the point release: a client reports `20250718.01`, `20250718.2` or
+ * `20250718` and all three are this build (see {@link gameBuild}). Keep the entries to the
+ * bare date — one with a `.NN` would match nothing.
  */
 export const SUPPORTED_GAME_VERSIONS: string[] = [
 	GAME_VERSION, // default
-	'20250718.01', // beta
+	'20250718', // beta (20250718.01)
 	'20230616', // alpha
 	'20231207', // alpha
-	'20250424.01', // alpha
-	'20260323.14', // alpha
+	'20250424', // alpha (20250424.01)
+	'20260323', // alpha (20260323.14)
 ]
 
-/** Whether a client-supplied build (the version check's `?v=`) is one we serve. */
+/**
+ * Whether a client-supplied version (the version check's `?v=`) names a build we serve.
+ * Compared as a build, so the client's point release never decides it.
+ */
 export function isSupportedGameVersion(version: string | null | undefined): boolean {
-	return version != null && SUPPORTED_GAME_VERSIONS.includes(version)
+	const build = gameBuild(version)
+	return build !== null && SUPPORTED_GAME_VERSIONS.includes(build)
 }
 
 /**
@@ -73,13 +97,18 @@ export function isSupportedGameVersion(version: string | null | undefined): bool
  *   pool) — the new build runs against its own voice servers, apart from the live pool.
  *
  * One list so the two gates can't drift: a build is either rolling out or it isn't. Remove a
- * build from here when it ships to everyone.
+ * build from here when it ships to everyone. Bare dates, like `SUPPORTED_GAME_VERSIONS`:
+ * every point release of a listed date is under rollout.
  */
-export const ROLLOUT_GAME_VERSIONS: readonly string[] = ['20260323.14']
+export const ROLLOUT_GAME_VERSIONS: readonly string[] = ['20260323']
 
-/** Whether a build (a token's `rn.ver`, a grant's posted `ver`) is one under staged rollout. */
+/**
+ * Whether a version (a token's `rn.ver`, a grant's posted `ver`) names a build under
+ * staged rollout.
+ */
 export function isRolloutGameVersion(version: string | null | undefined): boolean {
-	return version != null && ROLLOUT_GAME_VERSIONS.includes(version)
+	const build = gameBuild(version)
+	return build !== null && ROLLOUT_GAME_VERSIONS.includes(build)
 }
 
 /** Schema DDL (mirror of migrations/0006_presence.sql). */

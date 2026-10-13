@@ -4,7 +4,7 @@ import { useWorkersLogger } from 'workers-tagged-logger'
 
 import { mergePlayerSettings as mergeStoredPlayerSettings, readPlayerSettings } from '@repo/domain'
 import { logger, withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
-import { validateAndGetAccountId, validateAndGetVersion } from '@repo/jwt'
+import { validateAndGetAccountId, validateAndGetBuild } from '@repo/jwt'
 
 import { censorSwears } from '../../api/src/sanitize'
 import { NotificationType } from '../../notify/src/notification-types'
@@ -41,9 +41,9 @@ import {
 	ChatThreadType,
 	createThread,
 	getOrCreateThreadWithMembers,
+	getPartyThreadForPlayer,
 	getThreadForPlayer,
 	getThreadMemberIds,
-	getPartyThreadForPlayer,
 	getThreadMeta,
 	getThreadsForPlayer,
 	isThreadMember,
@@ -903,8 +903,8 @@ const app = new Hono<App>()
 			if (id === null) return c.body(null, 401)
 
 			// Path 1: already in a party. One query, no settings read.
-			const version = await validateAndGetVersion(c.req.raw, await c.env.JWT_SECRET.get())
-			const listResponse = version !== null && version >= '20260323'
+			const build = await validateAndGetBuild(c.req.raw, await c.env.JWT_SECRET.get())
+			const listResponse = build !== null && build >= '20260323'
 			const noParty = () => (listResponse ? c.json([]) : c.json({}))
 			let thread = await getPartyThreadForPlayer(c.env.DB, id)
 

@@ -10,7 +10,7 @@
 
 import { sign, verify } from 'hono/jwt'
 
-import { GAME_VERSION } from '@repo/domain'
+import { GAME_VERSION, gameBuild } from '@repo/domain'
 
 // Token lifetime in seconds (mirrored in the `expires_in` response field).
 // @todo Allegedly, the game is supposed to refresh tokens every 3600 seconds, but it doesn't.
@@ -133,6 +133,20 @@ export async function validateAndGetVersion(
 	} catch {
 		return null
 	}
+}
+
+/**
+ * {@link validateAndGetVersion} reduced to the BUILD it names — `gameBuild`'s bare
+ * `YYYYMMDD`, so `20250718.01` and `20250718.2` both read `20250718`. `null` for the
+ * same reasons as the version, and when the claim is empty. The form every build gate
+ * wants: a point release is the same build and must be served the same way, so nothing
+ * should compare the raw claim against a build.
+ */
+export async function validateAndGetBuild(
+	request: Request,
+	secret: string
+): Promise<string | null> {
+	return gameBuild(await validateAndGetVersion(request, secret))
 }
 
 /** Scopes stamped onto every token (as a claim array). */

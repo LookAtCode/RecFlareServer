@@ -14,6 +14,7 @@ import {
 	deletePresence,
 	deleteRoomInvite,
 	GAME_VERSION,
+	gameBuild,
 	getAccount,
 	getClubSummary,
 	getExpiredPresenceAccountIds,
@@ -387,16 +388,18 @@ async function callerVersion(c: Context<App>): Promise<string | null> {
 }
 
 /**
- * The build to matchmake the caller as — {@link callerVersion} with the server's own
- * `GAME_VERSION` standing in when the token doesn't say (the same fallback presence
- * uses, so a player's instance and their reported build agree).
+ * The BUILD to matchmake the caller as — {@link callerVersion} reduced to its date
+ * ({@link gameBuild}: `20250718.01` → `20250718`), with the server's own `GAME_VERSION`
+ * standing in when the token doesn't say (the same fallback presence uses, so a player's
+ * instance and their reported build agree). A point release is the same build: a
+ * `20250718.2` client lands in the `20250718` session, beside the `.01` who opened it.
  *
  * Unlike presence, this can never be left unset: it is the key an instance is created
  * under and searched by, and an empty one would pool every unknown-build player into a
  * shared "" bucket — exactly the mixed session the stamp exists to prevent.
  */
 async function callerGameVersion(c: Context<App>): Promise<string> {
-	return (await callerVersion(c)) ?? GAME_VERSION
+	return gameBuild(await callerVersion(c)) ?? GAME_VERSION
 }
 
 /**
@@ -711,16 +714,20 @@ const BANNED_FROM_ROOM = MatchmakingErrorCode.BannedFromRoom
  * `UpdateRequired`, the one code that says "your client can't go there" and the honest
  * answer. There is no code for the other direction ("they must update"), so a caller on
  * the newer build gets the opaque NoSuchRoom every other unjoinable thing answers.
- * Builds are date-stamped (`20230414`, `20250718.01`), so they order as strings; an
- * instance carrying no version at all (written before the stamp existed) is nobody's
+ * Both sides are compared as BUILDS ({@link gameBuild}) — either may arrive as a full
+ * client version (a presence row's `appVersion` is verbatim) and a point release is the
+ * same build. Builds are date-stamped (`20230414`, `20250718`), so they order as strings;
+ * an instance carrying no version at all (written before the stamp existed) is nobody's
  * build and refuses both ways.
  */
 function crossBuildRefusal(
 	callerVersion: string,
 	instanceVersion: string
 ): MatchmakingErrorCode | null {
-	if (callerVersion === instanceVersion) return null
-	return instanceVersion > callerVersion ? MatchmakingErrorCode.UpdateRequired : NO_SUCH_ROOM
+	const caller = gameBuild(callerVersion) ?? ''
+	const instance = gameBuild(instanceVersion) ?? ''
+	if (caller === instance) return null
+	return instance > caller ? MatchmakingErrorCode.UpdateRequired : NO_SUCH_ROOM
 }
 
 /**
@@ -854,12 +861,12 @@ function nextLiveMessageId(): number {
 const GAME_INVITE_V2_MIN_BUILD = 20230414
 
 /**
- * The date portion of a client build (`20250718.01` → `20250718`) as a number, or null when
- * there's nothing parseable to compare. Builds are `<yyyymmdd>[.<n>]`, so the leading date
- * orders them; the point release after it never decides this gate.
+ * A client build ({@link gameBuild}: `20250718.01` → `20250718`) as a number, or null when
+ * there's nothing parseable to compare. The leading date orders builds; the point release
+ * after it never decides a gate.
  */
 function buildNumber(version: string | null): number | null {
-	const date = Number.parseInt(version?.split('.')[0] ?? '', 10)
+	const date = Number.parseInt(gameBuild(version) ?? '', 10)
 	return Number.isNaN(date) ? null : date
 }
 
@@ -1563,10 +1570,11 @@ async function resolveRoomInstance(
 	const currentInstanceId = reusesInstance
 		? (await getPresence<RoomInstance>(c.env.DB, ownerId))?.roomInstance?.roomInstanceId
 		: undefined
-	// The same build, with GAME_VERSION standing in for a token that names none. It scopes
-	// the search below and is stamped on the instance when one is created, which is what
-	// keeps a session to a single client version.
-	const gameVersion = tokenVersion ?? GAME_VERSION
+	// The same BUILD (the date, with the client's point release dropped), with GAME_VERSION
+	// standing in for a token that names none. It scopes the search below and is stamped on
+	// the instance when one is created, which is what keeps a session to a single client
+	// build — and lets every point release of that build share it.
+	const gameVersion = gameBuild(tokenVersion) ?? GAME_VERSION
 	// Reuse an existing joinable instance *of the same subroom and the same build* —
 	// subrooms are separate places, so joining one must never land you in another, and
 	// neither must a session running a different version of the room. A published room
@@ -3114,7 +3122,7 @@ const app = new Hono<App>()
 				'…). Both are empty when the pool is unset or the caller is in no instance. A',
 				'sandbox account is picked out of the `TACHYON_HOST_PORT_SANDBOX` pool instead, the',
 				'same way, with ids `dev-1`, `dev-2`, …; a caller whose token’s `rn.ver` is a build',
-				'under staged rollout (`ROLLOUT_GAME_VERSIONS`, currently `20260323.14`) out of',
+				'under staged rollout (`ROLLOUT_GAME_VERSIONS`, currently `20260323`) out of',
 				'`TACHYON_HOST_PORT_ROLLOUT`, with ids `rollout-1`, `rollout-2`, …. Sandbox wins when',
 				'both apply, and either special pool left unset falls back to the live one.',
 				'`experiments` carries the client’s networking flags.',

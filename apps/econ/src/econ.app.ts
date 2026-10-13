@@ -22,7 +22,7 @@ import {
 	updateAccount,
 } from '@repo/domain'
 import { intVar, logger, withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
-import { validateAndGetAccountId, validateAndGetPlus, validateAndGetVersion } from '@repo/jwt'
+import { validateAndGetAccountId, validateAndGetBuild, validateAndGetPlus } from '@repo/jwt'
 
 import {
 	getCustomAvatarItems,
@@ -260,16 +260,17 @@ async function authedId(c: Context<App>): Promise<number | null> {
 /**
  * The client build this request's token was minted for (`rn.ver`), as a comparable NUMBER —
  * the leading `YYYYMMDD` of e.g. `20250718.01`, whose `.01` is a same-day rebuild and not a
- * version to order by. `null` when there is no valid token, when it carries no `rn.ver` (an
- * older token, issued before the claim did), or when the claim isn't a build at all.
+ * version to order by (`validateAndGetBuild` drops it). `null` when there is no valid
+ * token, when it carries no `rn.ver` (an older token, issued before the claim did), or
+ * when the claim isn't a build at all.
  *
  * Unverified — a client can claim any build — which is fine for what it gates here: a build
  * lying about itself only changes which storefront its own player is shown.
  */
 async function authedBuild(c: Context<App>): Promise<number | null> {
-	const version = await validateAndGetVersion(c.req.raw, await c.env.JWT_SECRET.get())
+	const version = await validateAndGetBuild(c.req.raw, await c.env.JWT_SECRET.get())
 	if (version === null) return null
-	const build = Number.parseInt(version.split('.')[0] ?? '', 10)
+	const build = Number.parseInt(version, 10)
 	return Number.isInteger(build) ? build : null
 }
 

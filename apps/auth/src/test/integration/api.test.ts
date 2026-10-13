@@ -1352,6 +1352,18 @@ describe('auth worker routes', () => {
 			})
 		})
 
+		test('every point release of the gated build is gated', async () => {
+			// The gate is on the BUILD (the bare date): the client's `.NN` is a same-day
+			// rebuild, so `.14`, `.2` and the date alone are all the rollout build.
+			await withRoleIds(undefined, async () => {
+				for (const version of ['20260323', '20260323.2', '20260323.14']) {
+					const res = await login('gate_outsider', version)
+					expect(res.status, version).toBe(400)
+					expect(res.json.error_description, version).toBe(REFUSED)
+				}
+			})
+		})
+
 		test('the credential is checked first, so the gate cannot probe for accounts', async () => {
 			await withRoleIds(undefined, async () => {
 				const res = await postToken(

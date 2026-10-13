@@ -93,7 +93,7 @@ import {
 	withNotFound,
 	withOnError,
 } from '@repo/hono-helpers'
-import { validateAndGetAccountId, validateAndGetRoles, validateAndGetVersion } from '@repo/jwt'
+import { validateAndGetAccountId, validateAndGetBuild, validateAndGetRoles } from '@repo/jwt'
 
 // The notification-type ids the hub carries (owned by the `notify` worker). Imported
 // as a value — the enum has no runtime dependencies.
@@ -470,16 +470,17 @@ async function authedAccountId(c: Context<App>): Promise<number | null> {
 }
 
 /**
- * The client build this request's token was minted for (`rn.ver`), or null when there's no
- * valid token. The claim is the build the CLIENT posted at login, not this server's
- * GAME_VERSION, so it identifies what the player is actually running.
+ * The client BUILD this request's token was minted for (`rn.ver` as its bare `YYYYMMDD`,
+ * so a `20250718.01` client reads `20250718`), or null when there's no valid token. The
+ * claim is the build the CLIENT posted at login, not this server's GAME_VERSION, so it
+ * identifies what the player is actually running.
  *
  * It is unverified — a client can claim any build — which is fine for the one thing it is
  * used for here: keeping a payload away from a build it breaks. Lying about your version to
  * opt IN to a broken room list only breaks your own client.
  */
 async function authedGameVersion(c: Context<App>): Promise<string | null> {
-	return validateAndGetVersion(c.req.raw, await c.env.JWT_SECRET.get())
+	return validateAndGetBuild(c.req.raw, await c.env.JWT_SECRET.get())
 }
 
 /**
@@ -493,9 +494,11 @@ async function authedGameVersion(c: Context<App>): Promise<string | null> {
  *
  * An allow-list rather than a "this build or newer" comparison, deliberately: the thing
  * being asserted is that a build was CHECKED, and a version string that sorts high (a
- * debug build, say) must not opt itself in. Add a build here once it's been tried.
+ * debug build, say) must not opt itself in. Add a build here once it's been tried — as
+ * the bare date, which is what {@link authedGameVersion} yields; every point release of
+ * it (`20250718.01`, `20250718.2`) is the same build.
  */
-const FEATURED_ROOMS_VERSIONS: ReadonlySet<string> = new Set(['20250718.01'])
+const FEATURED_ROOMS_VERSIONS: ReadonlySet<string> = new Set(['20250718'])
 
 /**
  * Operator-granted elevated roles — the ones the auth worker stamps from an account's
@@ -1522,7 +1525,7 @@ const app = new Hono<App>()
 				'',
 				'Restricted by CLIENT BUILD. Serving this to the 2023 client breaks its other room',
 				'listings (NREs, apparently from the featured-room load corrupting its room cache), so',
-				'only the builds known to render it — `20250718.01` today — get the group; anything',
+				'only the builds known to render it — `20250718` today — get the group; anything',
 				'else gets a 404, the same answer it got while the route was parked. The build is read',
 				'from the token’s `rn.ver` claim, which is why this needs a token at all: nothing in',
 				'the group itself is per-player.',

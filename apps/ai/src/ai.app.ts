@@ -3,7 +3,7 @@ import { describeRoute, openAPIRouteHandler } from 'hono-openapi'
 import { useWorkersLogger } from 'workers-tagged-logger'
 
 import { withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
-import { validateAndGetAccountId, validateAndGetVersion } from '@repo/jwt'
+import { validateAndGetAccountId, validateAndGetBuild } from '@repo/jwt'
 
 import {
 	AUTHED,
@@ -163,7 +163,7 @@ const app = new Hono<App>()
 		}
 	)
 
-	// 20260323.14 has native low-energy and no-energy companion support. Advertising
+	// The 20260323 build (20260323.14) has native low-energy and no-energy companion support. Advertising
 	// full energy selects a conversation backend we do not provide. Grant access with
 	// zero energy and the client's recognized no-credit result instead. A successful
 	// access response still opens a realtime session even when its energy is zero.
@@ -174,7 +174,7 @@ const app = new Hono<App>()
 			tags: ['Roomie AI', '2025'],
 			summary: 'The caller’s Roomie AI energy budget',
 			description: [
-				'20260323.14 receives the recognized no-credit result and zero energy for its native',
+				'The 20260323 build receives the recognized no-credit result and zero energy for its native',
 				'companion mode. Its DTO has no recharge field. Older clients retain the full',
 				'int32-max budget and null recharge time. No model session is created.',
 				'',
@@ -191,8 +191,9 @@ const app = new Hono<App>()
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
 
-			const version = await validateAndGetVersion(c.req.raw, await c.env.JWT_SECRET.get())
-			if (version === '20260323.14') {
+			// The build, not the version: every point release of 20260323 has the companion mode.
+			const build = await validateAndGetBuild(c.req.raw, await c.env.JWT_SECRET.get())
+			if (build === '20260323') {
 				return c.json({
 					success: false,
 					error_id: 'AI.InsufficientRoomieAICreditNoSub',

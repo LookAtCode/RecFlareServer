@@ -1274,6 +1274,15 @@ describe('rooms endpoints', () => {
 		expect(body.Rooms.every((r) => typeof r.RoomName === 'string')).toBe(true)
 		// The dorm (RoomId 1) is non-public, so it's never featured.
 		expect(body.Rooms.some((r) => r.RoomId === 1)).toBe(false)
+
+		// The allow-list holds the BUILD (the bare date), so every point release of it is
+		// served: a `.2` rebuild of the 2025 client renders the group the same as `.01`.
+		for (const version of ['20250718.2', '20250718']) {
+			const point = await SELF.fetch(`${ORIGIN}/featuredrooms/current`, {
+				headers: await bearer('1', undefined, version),
+			})
+			expect(point.status, version).toBe(200)
+		}
 	})
 
 	it('GET /featuredrooms/current serves at most 10 rooms', async () => {
@@ -6335,6 +6344,53 @@ describe('studio room bundles', () => {
 			UnityAssetHash: null,
 			UnitySubAssets: [],
 		})
+	})
+
+	// A FIRST-PARTY room's bundle — captured from the official game and loaded by hand
+	// under its `unity/<roomId>/` layout — shares `unity_asset` with Studio builds but is
+	// not UGC, and must not be folded onto the save: the 2025 client handed it inline
+	// takes it instead of asking the bulk lookup, cannot name it, and loads nothing (every
+	// imported room broke when the splice moved from the Studio-only table to `unity_asset`).
+	// The bulk lookup is where that client resolves it, and still serves it.
+	it('leaves a first-party bundle to the bulk lookup rather than the room read', async () => {
+		await reset()
+		const firstParty = 'unity/9901/8iaf2yemao2d1zurblo875cn2.assetbundle'
+		await putUnityAsset(env.DB, {
+			UnityAssetId: ASSET,
+			Target: 0,
+			Version: 3,
+			Filename: firstParty,
+			Hash: winHash,
+		})
+
+		type Loaded = {
+			SubRooms: Array<{ CurrentSave: { UnitySubAssets: unknown[]; SubRoomDataSaveId: number } }>
+		}
+		for (const query of ['', '?unityAssetTarget=0']) {
+			const room = (await (await SELF.fetch(`${ORIGIN}/rooms/9901${query}`)).json()) as Loaded
+			expect(room.SubRooms[0]!.CurrentSave.UnitySubAssets, query).toEqual([])
+		}
+
+		const saveId = ((await (await SELF.fetch(`${ORIGIN}/rooms/9901`)).json()) as Loaded)
+			.SubRooms[0]!.CurrentSave.SubRoomDataSaveId
+		const detail = await SELF.fetch(`${ORIGIN}/rooms/9901/subrooms/99011/saves/${saveId}`, {
+			headers: await bearer('1'),
+		})
+		expect(await detail.json()).toMatchObject({
+			UnityAsset: null,
+			UnityAssetHash: null,
+			UnitySubAssets: [],
+		})
+
+		const bulk = await SELF.fetch(`${ORIGIN}/unity_assets/baked/bulk`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: new URLSearchParams({ target: '0', version: '3', id: ASSET }).toString(),
+		})
+		expect(bulk.status).toBe(200)
+		expect(await bulk.json()).toEqual([
+			{ UnityAssetId: ASSET, Target: 0, Version: 3, Filename: firstParty, Hash: winHash },
+		])
 	})
 })
 

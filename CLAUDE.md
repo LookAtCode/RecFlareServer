@@ -49,13 +49,18 @@ Supported client builds live in `SUPPORTED_GAME_VERSIONS`
 (`packages/domain/src/presence-db.ts`); `GAME_VERSION` is the default the stack targets.
 
 - `20230414` — default, official. Manifest `7859140924515540835` (2023).
-- `20250718.01` — beta, official. Manifest `1151455856673601091`; reaches this server via
-  the [patch-2025](https://github.com/recflare/patch-2025) patch.
-- `20260323.14`, `20250424.01`, `20231207`, `20230616` — alpha.
+- `20250718` — beta, official (the `20250718.01` client). Manifest `1151455856673601091`;
+  reaches this server via the [patch-2025](https://github.com/recflare/patch-2025) patch.
+- `20260323` (`20260323.14`), `20250424` (`20250424.01`), `20231207`, `20230616` — alpha.
 
-Builds are date-stamped (`YYYYMMDD[.NN]`) so they order as plain strings; several
-surfaces gate on "newer than `20230414`" (econ storefront catalog, `api` event tags,
-`rooms` featured rooms) rather than on an explicit list.
+A client reports `YYYYMMDD[.NN]`; the `.NN` is a same-day point release of the same build
+and decides nothing. `gameBuild` strips it, the lists above hold bare dates, every gate
+compares builds (`validateAndGetBuild` in `@repo/jwt` is the token form), and the
+`room_instance` key is stored as the build so `20250718.01` and `20250718.2` share a
+session. The token's `rn.ver` and presence's `appVersion` still echo the client's full
+version. Builds order as plain strings; several surfaces gate on "newer than `20230414`"
+(econ storefront catalog, `api` event tags, `rooms` featured rooms) rather than on an
+explicit list.
 </game-clients>
 
 <code-style>

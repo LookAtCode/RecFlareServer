@@ -40,14 +40,18 @@ See [RecFlare Client](https://github.com/djdevin/recflare-client) for the offici
 
 These game builds are supported:
 
-| Build         | Manifest              | Support                                                                                 |
-| ------------- | --------------------- | --------------------------------------------------------------------------------------- |
-| `20230414`    | `7859140924515540835` | **Default**, official — the 2023 build the rest of the stack targets                    |
-| `20250718.01` | `1151455856673601091` | **Beta**, official — use the [patch-2025](https://github.com/recflare/patch-2025) patch |
-| `20260323.14` |                       | Alpha                                                                                   |
-| `20250424.01` |                       | Alpha                                                                                   |
-| `20231207`    |                       | Alpha                                                                                   |
-| `20230616`    |                       | Alpha                                                                                   |
+| Build      | Client version | Manifest              | Support                                                                                 |
+| ---------- | -------------- | --------------------- | --------------------------------------------------------------------------------------- |
+| `20230414` | `20230414`     | `7859140924515540835` | **Default**, official — the 2023 build the rest of the stack targets                    |
+| `20250718` | `20250718.01`  | `1151455856673601091` | **Beta**, official — use the [patch-2025](https://github.com/recflare/patch-2025) patch |
+| `20260323` | `20260323.14`  |                       | Alpha                                                                                   |
+| `20250424` | `20250424.01`  |                       | Alpha                                                                                   |
+| `20231207` | `20231207`     |                       | Alpha                                                                                   |
+| `20230616` | `20230616`     |                       | Alpha                                                                                   |
+
+A build is the `YYYYMMDD` date of the client version; the `.NN` after it is a same-day
+point release and is ignored everywhere, so `20250718.01`, `20250718.2` and `20250718`
+are all the beta build and share game sessions.
 
 Alpha builds get past the version check and largely work, but nothing else in the
 stack targets them, so expect protocol differences. Other client or game versions
