@@ -184,6 +184,13 @@ describe('rooms endpoints', () => {
 		expect(body).not.toHaveProperty('FriendlyName')
 	})
 
+	// A stub: boosts aren't implemented, so the count is a bare 0 for any room and player.
+	it('GET /rooms/:id/boosts/:playerId/count answers a bare 0', async () => {
+		const res = await SELF.fetch(`${ORIGIN}/rooms/112/boosts/205/count`)
+		expect(res.status).toBe(200)
+		expect(await res.json()).toBe(0)
+	})
+
 	// Pinned whole: these are the numbers the client's publish UI counts against, and
 	// `error: null` / `error_id` is a different envelope from the room mutations' — a
 	// "cleanup" that unified the two would break the client silently.

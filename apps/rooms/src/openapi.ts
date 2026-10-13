@@ -430,6 +430,11 @@ export const ExperienceRequest = z.object({
  */
 export const DormRoomId = z.int().describe('The caller’s dorm RoomId')
 
+/** `GET /rooms/{roomId}/boosts/{playerId}/count` — a bare integer, no envelope. */
+export const RoomBoostCount = z
+	.int()
+	.describe('Boosts the player has put on the room. Nothing grants boosts here, so always 0')
+
 /**
  * A room lookup result: the room, or `{}` when nothing matched. The by-id/by-name
  * lookups answer an empty object rather than a 404 — the client reads that as "no room".

@@ -150,6 +150,7 @@ import {
 	RoomBanEnvelope,
 	RoomBanHistoryEnvelope,
 	RoomBansRemovedEnvelope,
+	RoomBoostCount,
 	RoomDto,
 	RoomEnvelope,
 	RoomExperience,
@@ -1920,6 +1921,25 @@ const app = new Hono<App>()
 					: await getPublicVisitedRooms(c.env.DB, playerId, skip, take)
 			)
 		}
+	)
+
+	// How many boosts a player has put on a room. Boosts are not implemented — nothing
+	// grants or spends them, and the room DTO's `BoostCount` is a constant 0 for the same
+	// reason — so this is a stub that answers a bare integer 0 for any room and player,
+	// known or not, rather than leaving the client's request to 404.
+	.get(
+		'/rooms/:roomId{[0-9]+}/boosts/:playerId{[0-9]+}/count',
+		describeRoute({
+			tags: ['Interaction'],
+			summary: 'A player’s boost count on a room',
+			description: [
+				'Stub: boosts are not implemented, so this answers a bare `0` for every room and',
+				'player, whether or not either exists. No envelope — the body is the integer.',
+			].join(' '),
+			parameters: [roomIdParam, playerIdParam],
+			responses: { 200: json(RoomBoostCount, 'The boost count, always 0') },
+		}),
+		(c) => c.json(0)
 	)
 
 	// The current player's interaction state with a room (cheered/favorited/last
