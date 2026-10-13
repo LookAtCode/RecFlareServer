@@ -11,6 +11,17 @@
 
 export type FormFields = Record<string, string | File>
 
+/** Views into the request buffer: the upload route avoids two copies of every bundle. */
+export interface MultipartFile {
+	name: string
+	type: string
+	bytes: Uint8Array<ArrayBuffer>
+}
+
+export type MultipartBytesFields = Record<string, string | MultipartFile>
+
+export class MultipartTooLarge extends Error {}
+
 const CRLF = new Uint8Array([13, 10])
 const HEADER_END = new Uint8Array([13, 10, 13, 10])
 const DASHES = new Uint8Array([45, 45])
@@ -71,8 +82,8 @@ function headerValue(headers: string, name: string): string | null {
 	return m ? m[1].trim() : null
 }
 
-function parseParts(bytes: Uint8Array, boundary: string): FormFields {
-	const fields: FormFields = {}
+function parseParts(bytes: Uint8Array<ArrayBuffer>, boundary: string): MultipartBytesFields {
+	const fields: MultipartBytesFields = {}
 	const delimiter = new TextEncoder().encode(`--${boundary}`)
 	const decoder = new TextDecoder()
 
@@ -109,7 +120,7 @@ function parseParts(bytes: Uint8Array, boundary: string): FormFields {
 		const filename = filenameExt != null ? extendedValue(filenameExt) : params.get('filename')
 		if (filename != null) {
 			const type = headerValue(headers, 'content-type') ?? 'application/octet-stream'
-			fields[name] = new File([content.slice()], filename, { type })
+			fields[name] = { name: filename, type, bytes: content }
 		} else {
 			fields[name] = decoder.decode(content)
 		}
@@ -126,5 +137,44 @@ export async function parseMultipart(req: Request): Promise<FormFields> {
 	const boundary = boundaryOf(req.headers.get('content-type'))
 	if (boundary == null) return {}
 	const bytes = new Uint8Array(await req.arrayBuffer())
-	return parseParts(bytes, boundary)
+	return Object.fromEntries(
+		Object.entries(parseParts(bytes, boundary)).map(([name, value]) => [
+			name,
+			typeof value === 'string' ? value : new File([value.bytes], value.name, { type: value.type }),
+		])
+	)
+}
+
+/** Bound bytes while reading, including requests with no Content-Length header. */
+export async function parseMultipartBytes(
+	req: Request,
+	maxBytes: number
+): Promise<MultipartBytesFields> {
+	const boundary = boundaryOf(req.headers.get('content-type'))
+	if (boundary == null || req.body == null) return {}
+	const lengthHeader = req.headers.get('content-length')
+	const length = lengthHeader != null && /^\d+$/.test(lengthHeader) ? Number(lengthHeader) : null
+	if (length != null && (!Number.isSafeInteger(length) || length > maxBytes)) {
+		throw new MultipartTooLarge('Multipart upload exceeds the size limit.')
+	}
+	// A single buffer keeps a large request inside the Workers memory limit. When the
+	// size is unknown, reserve the limit rather than retaining chunks and copying them.
+	const buffer = new Uint8Array(length ?? maxBytes)
+	const reader = req.body.getReader()
+	let used = 0
+	try {
+		while (true) {
+			const { done, value } = await reader.read()
+			if (done) break
+			if (used + value.byteLength > buffer.byteLength) {
+				await reader.cancel()
+				throw new MultipartTooLarge('Multipart upload exceeds the declared size or size limit.')
+			}
+			buffer.set(value, used)
+			used += value.byteLength
+		}
+	} finally {
+		reader.releaseLock()
+	}
+	return parseParts(buffer.subarray(0, used), boundary)
 }

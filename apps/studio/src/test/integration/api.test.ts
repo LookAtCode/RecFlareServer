@@ -190,8 +190,7 @@ const LOCAL_ROOM = 7701
 const LOCAL_SUB = 8801
 const LOCAL_SAVE = 88001
 const UNSAVED_SUB = 8802
-const UPLOAD_FIRST =
-	'Upload the room before building locally. The latest save is where this build is recorded.'
+const UPLOAD_FIRST = 'Upload a room save first, and select a save that belongs to this subroom.'
 const BUNDLE_REQUIRED = 'Both a Windows bundle and an Android bundle are required.'
 const NOT_AUTHORIZED =
 	'You do not have authorization to upload RecFlare Studio content at this time.'
@@ -217,7 +216,14 @@ async function insertSubRoom(
 }
 
 function bundleFile(name: string, bytes: number[]): File {
-	return new File([new Uint8Array(bytes)], name)
+	return new File([new Uint8Array(bytes.length ? [...BUNDLE_HEADER, ...bytes] : [])], name)
+}
+
+const BUNDLE_HEADER = [...new TextEncoder().encode('UnityFS\0')]
+
+async function bundleHash(bytes: number[]): Promise<string> {
+	const digest = await crypto.subtle.digest('SHA-256', new Uint8Array([...BUNDLE_HEADER, ...bytes]))
+	return btoa(String.fromCharCode(...new Uint8Array(digest)))
 }
 
 async function postBuild(
@@ -378,21 +384,15 @@ describe('local cloud builds', () => {
 		expect(
 			files.map((file) => [file.target, file.version, file.kind, file.filename, file.hash])
 		).toEqual([
-			[0, 1, 'main', publicName('windows', 'main'), 'n2SnR+G5fxMfq7a0Rylsm28CAeefs8U1bmx36JtqgGo='],
-			[
-				0,
-				1,
-				'stripped',
-				publicName('windows', 'stripped'),
-				'ZqZ1cVH47lXbEncWx+Pc4L6AdLZOIO2lQuXB5GypxB4=',
-			],
-			[2, 1, 'main', publicName('android', 'main'), 'xCUiEotJGT3ozUXY91ic1+CF5l8ThkDVfUSC5fcYliM='],
+			[0, 1, 'main', publicName('windows', 'main'), await bundleHash([1, 2, 3, 4])],
+			[0, 1, 'stripped', publicName('windows', 'stripped'), await bundleHash([7, 8, 9])],
+			[2, 1, 'main', publicName('android', 'main'), await bundleHash([5, 6])],
 		])
 		const win = files.find((file) => file.target === 0 && file.kind === 'main')
 		// The bytes sit under `room/` — the prefix the client adds to the filename.
 		const stored = await env.CDN_ASSETS.get(`room/${win!.filename}`)
 		expect(stored).not.toBeNull()
-		expect([...new Uint8Array(await stored!.arrayBuffer())]).toEqual([1, 2, 3, 4])
+		expect([...new Uint8Array(await stored!.arrayBuffer())]).toEqual([...BUNDLE_HEADER, 1, 2, 3, 4])
 
 		const again = await postBuild('42', both)
 		expect(again.status).toBe(200)
@@ -458,7 +458,7 @@ describe('local cloud builds', () => {
 			`Content-Disposition: form-data; name=${name}; filename=${filename}; filename*=utf-8''${filename}\r\n\r\n`
 		const enc = new TextEncoder()
 		// Bundle bytes include CR, LF and `--` so the part scan has to honour the delimiter.
-		const winBytes = [85, 110, 105, 116, 121, 70, 83, 13, 10, 45, 45, 0, 255]
+		const winBytes = [...BUNDLE_HEADER, 13, 10, 45, 45, 0, 255]
 		const droidBytes = [85, 110, 105, 116, 121, 70, 83, 0, 13, 10]
 		const body = new Blob([
 			enc.encode(text('roomId', String(LOCAL_ROOM))),
@@ -495,5 +495,123 @@ describe('local cloud builds', () => {
 		expect(files.map((f) => f.target)).toEqual([0, 2])
 		const win = await env.CDN_ASSETS.get(`room/${files[0]!.filename}`)
 		expect([...new Uint8Array(await win!.arrayBuffer())]).toEqual(winBytes)
+	})
+})
+
+describe('Windows-only uploads and revision binding', () => {
+	const roomId = 7711
+	const subRoomId = 8811
+	const publishedSave = 88101
+	const stagedSave = 88102
+	const laterSave = 88103
+	const otherSub = 8812
+	const foreignSave = 88104
+	const fields = {
+		roomId: String(roomId),
+		subRoomId: String(subRoomId),
+		windows: bundleFile('windows.assetbundle', [1, 2, 3]),
+		allowWindowsOnly: 'true',
+	}
+
+	beforeAll(async () => {
+		await insertRoom(roomId, 42, [{ AccountId: 77, Role: 30, InvitedRole: 0 }])
+		await insertSubRoom(roomId, subRoomId, publishedSave)
+		await insertSubRoom(roomId, otherSub, foreignSave)
+		for (const saveId of [stagedSave, laterSave]) {
+			await env.DB.prepare(
+				'INSERT INTO subroom_save (sub_room_data_save_id, sub_room_id, data) VALUES (?1, ?2, ?3)'
+			)
+				.bind(saveId, subRoomId, JSON.stringify({ DataBlob: 'draft' }))
+				.run()
+		}
+		await env.DB.prepare('UPDATE subroom SET staged_save_id = ?2 WHERE sub_room_id = ?1')
+			.bind(subRoomId, stagedSave)
+			.run()
+	})
+
+	it('requires an explicit Windows-only opt-in and Studio permission', async () => {
+		expect((await postBuild('42', { ...fields, allowWindowsOnly: 'false' })).status).toBe(400)
+		expect((await postBuild('42', fields, ['developer'])).status).toBe(403)
+		expect((await postBuild('99', fields)).status).toBe(403)
+		expect((await postBuild(null, fields)).status).toBe(401)
+	})
+
+	it('rejects a file without the UnityFS signature and oversized bodies', async () => {
+		const invalid = await postBuild('42', {
+			...fields,
+			windows: new File(['some text'], 'windows.assetbundle'),
+		})
+		expect(invalid.status).toBe(400)
+		const oversized = await SELF.fetch(`${ORIGIN}/cloud-builds/from-editor`, {
+			method: 'POST',
+			headers: {
+				...(await bearer('42', STUDIO_ROLES)),
+				'content-type': 'multipart/form-data; boundary=x',
+				'content-length': String(64 * 1024 * 1024 + 1),
+			},
+			body: 'x',
+		})
+		expect(oversized.status).toBe(413)
+	})
+
+	it('attaches Windows to the staged save without changing what players load', async () => {
+		const res = await postBuild('77', fields)
+		expect(res.status).toBe(200)
+		const { value } = (await res.json()) as {
+			value: { unityAssetId: string; subRoomDataSaveId: number }
+		}
+		expect(value.subRoomDataSaveId).toBe(stagedSave)
+		const sub = await env.DB.prepare(
+			'SELECT current_save_id, staged_save_id FROM subroom WHERE sub_room_id = ?1'
+		)
+			.bind(subRoomId)
+			.first()
+		expect(sub).toEqual({ current_save_id: publishedSave, staged_save_id: stagedSave })
+		const published = await env.DB.prepare(
+			"SELECT json_extract(data, '$.UnityAssetId') AS id FROM subroom_save WHERE sub_room_data_save_id = ?1"
+		)
+			.bind(publishedSave)
+			.first<{ id: string | null }>()
+		expect(published?.id).toBeNull()
+		const { results } = await env.DB.prepare(
+			'SELECT target FROM unity_asset WHERE unity_asset_id = ?1'
+		)
+			.bind(value.unityAssetId)
+			.all()
+		expect(results).toEqual([{ target: 0 }])
+	})
+
+	it('uses the requested save even when a newer draft arrives', async () => {
+		await env.DB.prepare('UPDATE subroom SET staged_save_id = ?2 WHERE sub_room_id = ?1')
+			.bind(subRoomId, laterSave)
+			.run()
+		const res = await postBuild('42', {
+			...fields,
+			subRoomDataSaveId: String(stagedSave),
+		})
+		expect(res.status).toBe(200)
+		const { value } = (await res.json()) as { value: { subRoomDataSaveId: number } }
+		expect(value.subRoomDataSaveId).toBe(stagedSave)
+		const row = await env.DB.prepare(
+			"SELECT json_extract(data, '$.UnityAssetId') AS id FROM subroom_save WHERE sub_room_data_save_id = ?1"
+		)
+			.bind(laterSave)
+			.first<{ id: string | null }>()
+		expect(row?.id).toBeNull()
+	})
+
+	it("rejects malformed, missing, and another subroom's save IDs", async () => {
+		for (const saveId of ['0', '-1', 'word', String(foreignSave), '9999999']) {
+			const res = await postBuild('42', { ...fields, subRoomDataSaveId: saveId })
+			expect(res.status, saveId).toBe(400)
+		}
+	})
+
+	it('requires a main Android bundle when a stripped Android bundle is sent', async () => {
+		const res = await postBuild('42', {
+			...fields,
+			androidStripped: bundleFile('android-stripped.assetbundle', [1]),
+		})
+		expect(res.status).toBe(400)
 	})
 })

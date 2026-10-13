@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { parseMultipart } from '../multipart'
+import { MultipartTooLarge, parseMultipart, parseMultipartBytes } from '../multipart'
 
 const B = 'xyz'
 
@@ -61,5 +61,24 @@ describe('parseMultipart', () => {
 		expect(
 			await parseMultipart(request(`--${B}\r\nContent-Disposition: form-data; name=a\r\n\r\n1`))
 		).toEqual({})
+	})
+
+	it('bounds streamed bodies with and without a declared length', async () => {
+		const raw = `--${B}\r\nContent-Disposition: form-data; name=a\r\n\r\n1\r\n--${B}--\r\n`
+		expect(await parseMultipartBytes(request(raw), 1024)).toEqual({ a: '1' })
+		await expect(parseMultipartBytes(request(raw), 10)).rejects.toBeInstanceOf(MultipartTooLarge)
+		const declared = request(raw)
+		declared.headers.set('content-length', '2048')
+		await expect(parseMultipartBytes(declared, 1024)).rejects.toBeInstanceOf(MultipartTooLarge)
+	})
+
+	it('returns binary views without copying each file into File objects', async () => {
+		const raw = `--${B}\r\nContent-Disposition: form-data; name=f; filename=f\r\n\r\nbytes\r\n--${B}--\r\n`
+		const fields = await parseMultipartBytes(request(raw), 1024)
+		const file = fields.f
+		expect(typeof file).toBe('object')
+		if (typeof file === 'string' || file == null) throw new Error('missing file')
+		expect(file.name).toBe('f')
+		expect(new TextDecoder().decode(file.bytes)).toBe('bytes')
 	})
 })

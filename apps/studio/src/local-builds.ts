@@ -1,6 +1,7 @@
 import {
 	deleteUnityAssetBuilds,
 	getSubRoom,
+	getSubRoomSaveById,
 	markRoomAsRecRoomStudio,
 	publicStudioBundleFilename,
 	setSubRoomSaveUnityAssetId,
@@ -28,7 +29,7 @@ export interface LocalBundleFile {
 	platform: BundlePlatform
 	kind: BundleKind
 	filename: string
-	bytes: ArrayBuffer
+	bytes: Uint8Array<ArrayBuffer>
 }
 
 export interface StoredLocalBuild extends CloudBuildRow {
@@ -84,7 +85,7 @@ export async function listCloudBuilds(
 }
 
 /** Base64 SHA-256 — the encoding `unity_asset.hash` (and every other bundle hash) uses. */
-async function sha256Base64(bytes: ArrayBuffer): Promise<string> {
+async function sha256Base64(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
 	const digest = await crypto.subtle.digest('SHA-256', bytes)
 	let binary = ''
 	for (const byte of new Uint8Array(digest)) binary += String.fromCharCode(byte)
@@ -92,16 +93,15 @@ async function sha256Base64(bytes: ArrayBuffer): Promise<string> {
 }
 
 /**
- * Store a PC-built Windows + Android pair as a cloud build that is already finished.
+ * Store a PC-built bundle set as a cloud build that is already finished.
  * The bytes go to R2 under `room/` and each bundle becomes a `unity_asset` row — target
  * 0 Windows / 2 Android, its kind, the `filename` the client prefixes with `/room/` to
  * download it (so the R2 key is `room/<filename>`), the base64 SHA-256 as `hash`. The
- * build row points at the subroom's current save, that save's `UnityAssetId` is set
+ * build row points at the requested save (otherwise staged, then current), its `UnityAssetId` is set
  * to the new asset, and the room is marked as a Studio room the first time
  * (`BecameRRStudioRoomAt`).
  *
- * Returns null when the subroom has no current save — the caller uploaded bundles
- * before Upload created one.
+ * Returns null when the target save is absent or belongs to another subroom.
  */
 export async function storeLocalCloudBuild(
 	db: D1Database,
@@ -109,31 +109,40 @@ export async function storeLocalCloudBuild(
 	roomId: number,
 	subRoomId: number,
 	accountId: number,
-	files: LocalBundleFile[]
+	files: LocalBundleFile[],
+	requestedSaveId?: number
 ): Promise<StoredLocalBuild | null> {
 	const sub = await getSubRoom(db, roomId, subRoomId)
 	if (!sub) return null
-	const save = sub.CurrentSave
-	const saveId =
-		save && typeof save === 'object'
-			? Number((save as { SubRoomDataSaveId?: unknown }).SubRoomDataSaveId)
+	const current = sub.CurrentSave
+	const currentSaveId =
+		current && typeof current === 'object'
+			? Number((current as { SubRoomDataSaveId?: unknown }).SubRoomDataSaveId)
 			: NaN
-	if (!Number.isInteger(saveId) || saveId <= 0) return null
+	// Upload normally stages the new revision. Attaching to CurrentSave would replace
+	// the published room's bundles while leaving the creator's draft without a build.
+	const saveId = requestedSaveId ?? sub.StagedSubRoomDataSaveId ?? currentSaveId
+	if (typeof saveId !== 'number' || !Number.isSafeInteger(saveId) || saveId <= 0) return null
+	if (!(await getSubRoomSaveById(db, subRoomId, saveId))) return null
 
 	const now = new Date().toISOString()
 	const cloudBuildId = crypto.randomUUID()
 	const unityAssetId = crypto.randomUUID()
 
-	const stored = await Promise.all(
-		files.map(async (file) => {
+	const stored: Array<LocalBundleFile & { hash: string }> = []
+	try {
+		for (const file of files) {
 			// The client downloads `/room/<filename>` from the bucket, so the stored name is
 			// this build's, not the uploaded basename two rooms can share.
 			const filename = publicStudioBundleFilename(roomId, unityAssetId, file.platform, file.kind)
 			const hash = await sha256Base64(file.bytes)
 			await bucket.put(studioBundleR2Key(filename), file.bytes)
-			return { ...file, filename, hash }
-		})
-	)
+			stored.push({ ...file, filename, hash })
+		}
+	} catch (err) {
+		await Promise.all(stored.map((file) => bucket.delete(studioBundleR2Key(file.filename))))
+		throw err
+	}
 
 	const discardObjects = () =>
 		Promise.all(stored.map((file) => bucket.delete(studioBundleR2Key(file.filename))))

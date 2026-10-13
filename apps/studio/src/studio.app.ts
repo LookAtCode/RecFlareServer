@@ -11,11 +11,11 @@ import { withNotFound, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
 
 import { listCloudBuilds, storeLocalCloudBuild } from './local-builds'
-import { parseMultipart } from './multipart'
+import { MultipartTooLarge, parseMultipartBytes } from './multipart'
 
 import type { Context } from 'hono'
 import type { App } from './context'
-import type { FormFields } from './multipart'
+import type { MultipartBytesFields } from './multipart'
 
 /**
  * A query id the editor already validated as a positive integer. Anything else is
@@ -29,8 +29,10 @@ function positiveId(raw: string | undefined): number | null {
 }
 
 const BUNDLE_REQUIRED = 'Both a Windows bundle and an Android bundle are required.'
-const UPLOAD_FIRST =
-	'Upload the room before building locally. The latest save is where this build is recorded.'
+const WINDOWS_REQUIRED = 'A Windows bundle is required.'
+const INVALID_BUNDLE = 'Every uploaded bundle must have a UnityFS header.'
+const MAX_UPLOAD_BYTES = 64 * 1024 * 1024
+const UPLOAD_FIRST = 'Upload a room save first, and select a save that belongs to this subroom.'
 const NOT_AUTHORIZED =
 	'You do not have authorization to upload RecFlare Studio content at this time.'
 
@@ -53,11 +55,11 @@ function cloudBuildPage(c: Context<App>): {
 	return { roomId, subRoomId, skip, take: Math.min(take, 100) }
 }
 
-function rejected(c: Context<App>, status: 400 | 403 | 404, error: string) {
+function rejected(c: Context<App>, status: 400 | 403 | 404 | 413, error: string) {
 	return c.json({ success: false, error, value: null }, status)
 }
 
-function formText(form: FormFields, name: string): string | undefined {
+function formText(form: MultipartBytesFields, name: string): string | undefined {
 	const value = form[name]
 	return typeof value === 'string' ? value : undefined
 }
@@ -69,27 +71,27 @@ function bundleFilename(name: string): string {
 	return cleaned.length > 0 ? cleaned : 'bundle.assetbundle'
 }
 
-async function bundlePart(
-	form: FormFields,
+function bundlePart(
+	form: MultipartBytesFields,
 	field: string,
 	platform: 'windows' | 'android',
 	kind: 'main' | 'stripped'
 ) {
 	const value = form[field]
-	if (!(value instanceof File) || value.size === 0) return null
+	if (value == null || typeof value === 'string' || value.bytes.byteLength === 0) return null
 	return {
 		platform,
 		kind,
 		filename: bundleFilename(value.name),
-		bytes: await value.arrayBuffer(),
+		bytes: value.bytes,
 	}
 }
 
 /**
- * The editor button builds Windows, then Android, on the creator's PC and posts both
- * bundles here. This is not `cloud-builds/create` (that one only names a save and
+ * The editor builds bundles on the creator's PC and posts them here. Android may
+ * be omitted only with an explicit Windows-only opt-in. This is not `cloud-builds/create` (that one only names a save and
  * waits for a server build). The pair is stored as a cloud build that is already
- * finished, on the subroom's current save.
+ * finished, on the explicitly selected save or the latest staged/current save.
  */
 async function postLocalCloudBuild(c: Context<App>) {
 	const secret = await c.env.JWT_SECRET.get()
@@ -101,7 +103,15 @@ async function postLocalCloudBuild(c: Context<App>) {
 
 	// Not `c.req.parseBody()`: the editor leaves its form-data names unquoted, which the
 	// runtime's parser rejects outright. See multipart.ts.
-	const form = await parseMultipart(c.req.raw)
+	let form: MultipartBytesFields
+	try {
+		form = await parseMultipartBytes(c.req.raw, MAX_UPLOAD_BYTES)
+	} catch (err) {
+		if (err instanceof MultipartTooLarge) {
+			return rejected(c, 413, 'The multipart upload must be at most 64 MiB.')
+		}
+		throw err
+	}
 
 	const roomId = positiveId(formText(form, 'roomId'))
 	if (roomId == null) return rejected(c, 404, 'No such room.')
@@ -114,14 +124,27 @@ async function postLocalCloudBuild(c: Context<App>) {
 	const sub = await getSubRoom(c.env.DB, roomId, subRoomId)
 	if (!sub) return rejected(c, 404, 'No such subroom.')
 
-	const windows = await bundlePart(form, 'windows', 'windows', 'main')
-	const android = await bundlePart(form, 'android', 'android', 'main')
-	if (!windows || !android) return rejected(c, 400, BUNDLE_REQUIRED)
-	const files = [windows, android]
-	const windowsStripped = await bundlePart(form, 'windowsStripped', 'windows', 'stripped')
-	const androidStripped = await bundlePart(form, 'androidStripped', 'android', 'stripped')
+	const requestedSave = formText(form, 'subRoomDataSaveId')
+	const requestedSaveId = requestedSave == null ? undefined : positiveId(requestedSave)
+	if (requestedSaveId === null) return rejected(c, 400, 'Invalid subRoomDataSaveId.')
+	const windowsOnly = formText(form, 'allowWindowsOnly')?.toLowerCase() === 'true'
+	const windows = bundlePart(form, 'windows', 'windows', 'main')
+	const android = bundlePart(form, 'android', 'android', 'main')
+	if (!windows || (!android && !windowsOnly)) {
+		return rejected(c, 400, windowsOnly ? WINDOWS_REQUIRED : BUNDLE_REQUIRED)
+	}
+	const files = android ? [windows, android] : [windows]
+	const windowsStripped = bundlePart(form, 'windowsStripped', 'windows', 'stripped')
+	const androidStripped = bundlePart(form, 'androidStripped', 'android', 'stripped')
 	if (windowsStripped) files.push(windowsStripped)
+	if (androidStripped && !android) {
+		return rejected(c, 400, 'An Android stripped bundle requires an Android main bundle.')
+	}
 	if (androidStripped) files.push(androidStripped)
+	const signature = new TextEncoder().encode('UnityFS\0')
+	if (files.some((file) => signature.some((byte, i) => file.bytes[i] !== byte))) {
+		return rejected(c, 400, INVALID_BUNDLE)
+	}
 
 	const stored = await storeLocalCloudBuild(
 		c.env.DB,
@@ -129,7 +152,8 @@ async function postLocalCloudBuild(c: Context<App>) {
 		roomId,
 		subRoomId,
 		accountId,
-		files
+		files,
+		requestedSaveId
 	)
 	if (!stored) return rejected(c, 400, UPLOAD_FIRST)
 
@@ -143,6 +167,7 @@ async function postLocalCloudBuild(c: Context<App>) {
 			error: stored.error,
 			unityAssetId: stored.unityAssetId,
 			createdByAccountId: stored.createdByAccountId,
+			subRoomDataSaveId: stored.subRoomDataSaveId,
 		},
 	})
 }
