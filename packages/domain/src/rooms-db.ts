@@ -702,7 +702,1273 @@ export async function setRoomLeaderboard(
  * or null when the slot wasn't configured, which lets the caller tell a real delete
  * from a no-op.
  */
-export async function deleteRoomLea…13384 tokens truncated…erted.
+export async function deleteRoomLeaderboard(
+	db: D1Database,
+	roomId: number,
+	leaderboardId: number
+): Promise<RoomLeaderboard | null> {
+	const row = await db
+		.prepare('DELETE FROM room_leaderboard WHERE room_id = ?1 AND leaderboard_id = ?2 RETURNING *')
+		.bind(roomId, leaderboardId)
+		.first<RoomLeaderboardRow>()
+	return row ? toRoomLeaderboard(row) : null
+}
+
+/**
+ * A player's saved data for one room — the blob the client posted, verbatim. Null when
+ * the player has never saved anything there.
+ */
+export async function getPlayerData(
+	db: D1Database,
+	roomId: number,
+	playerId: number
+): Promise<string | null> {
+	const row = await db
+		.prepare('SELECT data FROM playerdata WHERE room_id = ?1 AND player_id = ?2')
+		.bind(roomId, playerId)
+		.first<{ data: string }>()
+	return row ? row.data : null
+}
+
+/**
+ * Store a player's data for one room, returning what was stored. One row per (room,
+ * player): a re-save overwrites the blob in place rather than keeping history, so the
+ * call is idempotent.
+ */
+export async function setPlayerData(
+	db: D1Database,
+	roomId: number,
+	playerId: number,
+	data: string
+): Promise<string> {
+	const row = await db
+		.prepare(
+			`INSERT INTO playerdata (room_id, player_id, data) VALUES (?1, ?2, ?3)
+			 ON CONFLICT(room_id, player_id) DO UPDATE SET data = ?3
+			 RETURNING data`
+		)
+		.bind(roomId, playerId, data)
+		.first<{ data: string }>()
+	// RETURNING always yields the upserted row.
+	return row!.data
+}
+
+/**
+ * Clone an existing room into a new one owned by `accountId`. Copies the source
+ * room's content (scene/subrooms/settings), assigning a fresh RoomId, the given
+ * name, and the new owner. The clone keeps only the source's SYSTEM tags (`Type` 1,
+ * `RoomTagType.auto` — `beta`, `limitsv2`): the client posts those to describe what the
+ * scene needs to run, so a copy of the scene needs them too. Every other tag (the owner's
+ * `Type` 0 tags, the `base` template tag, the server-derived `rro`) is dropped, so the
+ * owner tags the clone from scratch. `IsRRO` is cleared so the client doesn't render a
+ * virtual "RRO" tag on it, `IsDeveloperOwned`/`CloningAllowed` are cleared, its `Stats`
+ * start at zero, and it starts PRIVATE rather than inheriting the source's visibility.
+ * Returns the new room, or null when the source isn't in D1 or disallows cloning.
+ */
+export async function cloneRoom(
+	db: D1Database,
+	sourceRoomId: number,
+	name: string,
+	accountId: number
+): Promise<Room | null> {
+	const source = await getRoomById(db, sourceRoomId)
+	if (!source || source.CloningAllowed === false) return null
+
+	const row = await db
+		.prepare('SELECT MAX(room_id) AS maxId FROM room')
+		.first<{ maxId: number | null }>()
+	const newRoomId = (row?.maxId ?? 0) + 1
+
+	// Ownership is reset to the cloner — the source room's Roles (its creator and
+	// any co-owners, e.g. the seeded base-room roles for accounts 1/2) must NOT
+	// carry over, or the clone would still list the template's owner as owner.
+	const roles: RoomRole[] = [
+		{
+			AccountId: accountId,
+			Role: Role.Creator,
+			LastChangedByAccountId: null,
+			InvitedRole: Role.None,
+		},
+	]
+
+	// The system tags (`Type` 1: `beta`, `limitsv2`) carry over — the client derives them
+	// from what the scene is built with and the clone is the same scene, so without them
+	// the copy doesn't work. Nothing else does: no owner tags, no `base`, no `rro`, and no
+	// primary-genre flag (an auto tag is never the genre).
+	const sourceTags = Array.isArray(source.Tags) ? (source.Tags as RoomTag[]) : []
+	const systemTags: RoomTag[] = sourceTags
+		.filter((t) => t.Type === RoomTagType.auto)
+		.map((t) => ({ Tag: t.Tag, Type: RoomTagType.auto }))
+
+	const cloned: Room = {
+		...source,
+		RoomId: newRoomId,
+		Name: name,
+		CreatorAccountId: accountId,
+		IsDorm: false,
+		// Start fresh, except for the system tags the scene needs to run (see below).
+		Tags: systemTags,
+		// A user clone is not a Rec Room Original — clear the inherited flag, or the
+		// client renders a virtual "RRO" tag on the clone.
+		IsRRO: false,
+		// Neither is the cloner a developer, and a copy doesn't inherit the source's consent
+		// to be copied: the new owner opts their room into cloning themselves.
+		IsDeveloperOwned: false,
+		CloningAllowed: false,
+		// A brand-new room is unpublished: the owner publishes it by setting the room's
+		// accessibility. Inheriting the source's would put the clone straight into the
+		// public feeds (hot/search/recommendations/similar all key on Accessibility === 1)
+		// the moment it was made — every clone of a PUBLIC source, template or player room.
+		Accessibility: Accessibility.Private,
+		Roles: roles,
+		// A fresh room has no engagement of its own — don't inherit any of the source's
+		// counters. `storedStats` alone would keep the blob-owned `VisitorCount`, which
+		// `hotScore` ranks on.
+		Stats: { ...ZERO_STATS },
+		CreatedAt: new Date().toISOString(),
+	}
+
+	// serializeRoom drops the hydrated SubRooms from the blob; the clone's subrooms are
+	// inserted into the subroom table below with fresh globally-unique ids.
+	await db.prepare('INSERT INTO room (data) VALUES (?1)').bind(serializeRoom(cloned)).run()
+	// Tags live in `room_tag`, not the blob: the system tags need their own write.
+	if (systemTags.length > 0) await setRoomTags(db, newRoomId, systemTags)
+	const sourceSubRooms = Array.isArray(source.SubRooms) ? (source.SubRooms as SubRoom[]) : []
+	const clonedSubRooms: SubRoom[] = []
+	for (const sub of sourceSubRooms) {
+		clonedSubRooms.push(await insertSubRoom(db, newRoomId, { ...sub, CreatorAccountId: accountId }))
+	}
+	cloned.SubRooms = clonedSubRooms
+	// Inherited from the (parsed) source in practice; defaulted here too so a clone is
+	// never the one room shape missing them.
+	attachRoomDtoDefaults(cloned)
+	return cloned
+}
+
+/** Set a room's Description in place (the caller is responsible for the owner check). */
+export async function setRoomDescription(
+	db: D1Database,
+	roomId: number,
+	description: string
+): Promise<void> {
+	await db
+		.prepare("UPDATE room SET data = json_set(data, '$.Description', ?2) WHERE room_id = ?1")
+		.bind(roomId, description)
+		.run()
+}
+
+/** A room's progression settings, as `GET /rooms/:id/experience` serves them. */
+export interface RoomProgression {
+	Enabled: boolean
+	DailyLimit: number
+}
+
+/**
+ * Read a room's progression settings off its blob: `progressionEnabled` and
+ * `progressionDailyLimit`. A room that has never had them set reads as off with a 0 cap.
+ */
+export function roomProgression(room: Room): RoomProgression {
+	const limit = room.progressionDailyLimit
+	return {
+		Enabled: room.progressionEnabled === true,
+		DailyLimit: typeof limit === 'number' && Number.isFinite(limit) ? limit : 0,
+	}
+}
+
+/**
+ * Set a room's progression settings in place (the caller checks ownership first). These
+ * are `progressionEnabled` / `progressionDailyLimit` on the blob; the per-player XP is in
+ * `room_xp` (see room-xp-db.ts).
+ */
+export async function setRoomProgression(
+	db: D1Database,
+	roomId: number,
+	enabled: boolean,
+	dailyLimit: number
+): Promise<void> {
+	await db
+		.prepare(
+			`UPDATE room
+			 SET data = json_set(data, '$.progressionEnabled', json(?2), '$.progressionDailyLimit', ?3)
+			 WHERE room_id = ?1`
+		)
+		.bind(roomId, enabled ? 'true' : 'false', dailyLimit)
+		.run()
+}
+
+/** Set a room's Name in place (the caller checks ownership + name uniqueness first). */
+export async function setRoomName(db: D1Database, roomId: number, name: string): Promise<void> {
+	await db
+		.prepare("UPDATE room SET data = json_set(data, '$.Name', ?2) WHERE room_id = ?1")
+		.bind(roomId, name)
+		.run()
+}
+
+/** Set a room's ImageName in place (the caller is responsible for the owner check). */
+export async function setRoomImage(
+	db: D1Database,
+	roomId: number,
+	imageName: string
+): Promise<void> {
+	await db
+		.prepare("UPDATE room SET data = json_set(data, '$.ImageName', ?2) WHERE room_id = ?1")
+		.bind(roomId, imageName)
+		.run()
+}
+
+/**
+ * Stamp `BecameRRStudioRoomAt` the first time a Rec Room Studio build is stored for
+ * this room. A room that already carries a timestamp keeps it: a later local build
+ * is another cloud build, not a new moment of becoming a Studio room. A missing key
+ * and a JSON null both count as unset (`json_type` is not `text`).
+ */
+export async function markRoomAsRecRoomStudio(
+	db: D1Database,
+	roomId: number,
+	at: string
+): Promise<void> {
+	await db
+		.prepare(
+			`UPDATE room SET data = json_set(data, '$.BecameRRStudioRoomAt', ?2)
+			 WHERE room_id = ?1 AND json_type(data, '$.BecameRRStudioRoomAt') IS NOT 'text'`
+		)
+		.bind(roomId, at)
+		.run()
+}
+
+/**
+ * Point one existing subroom save at a baked Unity asset, in place. Local Studio
+ * builds attach to a specific staged or published revision; they do not append a
+ * new save row or publish it. Returns false when that save id is not this subroom's.
+ */
+export async function setSubRoomSaveUnityAssetId(
+	db: D1Database,
+	subRoomId: number,
+	saveId: number,
+	unityAssetId: string
+): Promise<boolean> {
+	const result = await db
+		.prepare(
+			`UPDATE subroom_save SET data = json_set(data, '$.UnityAssetId', ?3)
+			 WHERE sub_room_data_save_id = ?1 AND sub_room_id = ?2`
+		)
+		.bind(saveId, subRoomId, unityAssetId)
+		.run()
+	return (result.meta.changes ?? 0) > 0
+}
+
+/**
+ * Merge a set of top-level fields into a room's JSON blob and write it back. Used by
+ * the room-settings mutations whose values include booleans (cloning, platform
+ * restrictions) — rewriting the whole blob preserves proper JSON booleans, whereas a
+ * `json_set` bind would store `true`/`false` as `1`/`0`. The caller supplies the
+ * already-loaded, permission-checked room. Returns the updated room.
+ */
+export async function updateRoomFields(
+	db: D1Database,
+	roomId: number,
+	room: Room,
+	patch: Record<string, unknown>
+): Promise<Room> {
+	const updated: Room = { ...room, ...patch }
+	await db
+		.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1')
+		.bind(roomId, serializeRoom(updated))
+		.run()
+	return updated
+}
+
+/**
+ * Whether a role tier can only be taken by INVITATION — offered with
+ * {@link inviteRoomRole} and accepted by the player themselves via
+ * {@link answerRoomRoleInvite} — rather than granted outright.
+ *
+ * {@link Role.CoOwner} is the tier this rule exists for: nobody can force-add a co-owner,
+ * it is always an invite the player accepts. {@link Role.Creator} is included because it is
+ * strictly more than co-ownership — it would make no sense for the bigger grant to be the
+ * one that skips the ceremony. Expressed as `>=` so a tier added between or above them is
+ * covered by default: a new high-privilege role should have to be accepted until someone
+ * decides otherwise, not be grantable because nobody updated this list.
+ */
+export function roleRequiresInvite(role: number): boolean {
+	return role >= Role.CoOwner
+}
+
+/**
+ * GRANT a room role outright — updating the target account's existing `Roles` entry or
+ * appending one — and stamp `LastChangedByAccountId` with the editor. This is the owner's
+ * half of role management, and it takes effect immediately: the helper tiers
+ * ({@link Role.Host}, {@link Role.Moderator} and whatever else the client hands out) are the
+ * owner's to give.
+ *
+ * Returns null, writing nothing, for a tier that {@link roleRequiresInvite} — nobody can
+ * force-add a co-owner, whoever is asking. The rule lives HERE rather than in the route that
+ * currently calls this, because it is an invariant of the room's `Roles` and not a policy of
+ * one endpoint: the only way a `Role` of {@link Role.CoOwner} may ever appear on an entry is
+ * {@link answerRoomRoleInvite} promoting an `InvitedRole` the room's owner offered.
+ *
+ * The caller supplies the already-loaded room (after its gate) to avoid a re-read; the whole
+ * room JSON is rewritten. Any pending `InvitedRole` on the entry is left standing — a granted
+ * Host with a co-owner invite open still has it to answer.
+ */
+export async function setRoomRole(
+	db: D1Database,
+	roomId: number,
+	targetAccountId: number,
+	role: number,
+	changedByAccountId: number,
+	room: Room
+): Promise<Room | null> {
+	if (roleRequiresInvite(role)) return null
+
+	const roles = roomRoles(room)
+	const existing = roles.find((r) => r.AccountId === targetAccountId)
+	if (existing) {
+		existing.Role = role
+		existing.LastChangedByAccountId = changedByAccountId
+	} else {
+		roles.push({
+			AccountId: targetAccountId,
+			Role: role,
+			LastChangedByAccountId: changedByAccountId,
+			InvitedRole: Role.None,
+		})
+	}
+
+	const updated: Room = { ...room, Roles: roles }
+	await db
+		.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1')
+		.bind(roomId, serializeRoom(updated))
+		.run()
+	return updated
+}
+
+/**
+ * REVOKE a room role — dropping the target's `Roles` entry outright. This is how a room's
+ * owner or a co-owner takes back a role they handed out, and it is the counterpart to
+ * {@link setRoomRole}: there is no "demote to nothing" tier, because {@link Role.None} is the
+ * resting value of a PENDING invite rather than a role somebody holds. An entry that confers
+ * nothing should not exist, so a revoke removes the record.
+ *
+ * Two entries are protected, and both refuse by returning null without writing:
+ *
+ *  - The room's OWNER — `CreatorAccountId`, or a {@link Role.Creator} entry. Ownership is not
+ *    a role to be taken away by anyone standing beside it; it moves through
+ *    {@link transferRoomOwnership} and nowhere else. Without this a co-owner could remove the
+ *    creator's entry, and on an older room whose creator has no entry at all they could not —
+ *    so the check is on `CreatorAccountId` as well as on the tier.
+ *  - A CO-OWNER entry, unless the caller is the room's owner. Co-owners are peers: letting one
+ *    remove another means whichever of them asks first wins, and the room's owner is the only
+ *    person who is not a peer of theirs. A co-owner may still revoke the helper tiers.
+ *
+ * Removing a role a player does not have is NOT a failure — the room comes back unchanged and
+ * nothing is written. The caller asked for this player to hold no role, and they hold none;
+ * answering an error would make a client retrying a removal look broken.
+ *
+ * Takes any pending `InvitedRole` with it, since the whole entry goes. That is the same
+ * trade {@link answerRoomRoleInvite} makes when declining, and it means revoking a role from
+ * someone who has a co-owner invite standing also withdraws the invite.
+ *
+ * `removedByAccountId` is not stamped anywhere — the entry it would be stamped on is the one
+ * being deleted — and is read only to decide which of the two protections apply. The caller
+ * supplies the already-loaded room (after its gate) to avoid a re-read; the whole room JSON
+ * is rewritten.
+ */
+export async function removeRoomRole(
+	db: D1Database,
+	roomId: number,
+	targetAccountId: number,
+	removedByAccountId: number,
+	room: Room
+): Promise<Room | null> {
+	if (room.CreatorAccountId === targetAccountId) return null
+
+	const roles = roomRoles(room)
+	const index = roles.findIndex((r) => r.AccountId === targetAccountId)
+	if (index === -1) return room
+
+	const entry = roles[index]
+	if (entry.Role === Role.Creator) return null
+	if (entry.Role === Role.CoOwner && !isRoomOwner(room, removedByAccountId)) return null
+
+	roles.splice(index, 1)
+	const updated: Room = { ...room, Roles: roles }
+	await db
+		.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1')
+		.bind(roomId, serializeRoom(updated))
+		.run()
+	return updated
+}
+
+/**
+ * TRANSFER a room to a new owner: the recipient becomes {@link Role.Creator} and the
+ * outgoing owner is left as {@link Role.CoOwner}, keeping their access to a room they built
+ * without keeping the room.
+ *
+ * `CreatorAccountId` moves too, and it has to. It is the room's real owner field — every
+ * gate short-circuits on it ({@link canManageRoom}, {@link isRoomOwner}), the "rooms I made"
+ * lists select on it, and it is what the client shows. Moving only the `Roles` entries would
+ * give the room two owners: the new one by role, the old one by `CreatorAccountId`, still
+ * able to hand the room on again.
+ *
+ * Exempt from {@link roleRequiresInvite}, which otherwise means nobody is handed
+ * {@link Role.Creator} without accepting it. This is not a grant made ABOUT someone by a
+ * third party; it is the sole person who could already do anything at all to this room
+ * giving it away. The recipient gets a room, not a liability, and requiring them to accept
+ * would leave the room in a half-transferred state in the meantime.
+ *
+ * Returns null, writing nothing, for a DORM. A dorm is found by its owner
+ * ({@link getDormRoom} selects on `creator_account_id AND is_dorm`), so transferring one
+ * would hand somebody else's dorm to the recipient — who already has their own — and mint
+ * the original owner a fresh empty one on next access, their build gone.
+ *
+ * The caller supplies the already-loaded room (after its owner check) to avoid a re-read;
+ * the whole room JSON is rewritten. Pending invites on either entry are left standing.
+ */
+export async function transferRoomOwnership(
+	db: D1Database,
+	roomId: number,
+	fromAccountId: number,
+	toAccountId: number,
+	room: Room
+): Promise<Room | null> {
+	if (room.IsDorm === true) return null
+
+	const roles = roomRoles(room)
+	// Both sides get an entry whether or not they had one: the outgoing owner may never have
+	// been in `Roles` at all (the older rooms carry no entry for their creator), and the
+	// recipient is usually a stranger to the room.
+	const setRole = (accountId: number, role: number): void => {
+		const existing = roles.find((r) => r.AccountId === accountId)
+		if (existing) {
+			existing.Role = role
+			existing.LastChangedByAccountId = fromAccountId
+		} else {
+			roles.push({
+				AccountId: accountId,
+				Role: role,
+				LastChangedByAccountId: fromAccountId,
+				InvitedRole: Role.None,
+			})
+		}
+	}
+	setRole(toAccountId, Role.Creator)
+	setRole(fromAccountId, Role.CoOwner)
+
+	const updated: Room = { ...room, CreatorAccountId: toAccountId, Roles: roles }
+	await db
+		.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1')
+		.bind(roomId, serializeRoom(updated))
+		.run()
+	return updated
+}
+
+/**
+ * ANSWER a standing room-role invite — accept it, or decline it with `role` 0.
+ *
+ * Accepting promotes the account's `Roles` entry from its pending `InvitedRole` to the real
+ * `Role` and clears the pending one, so an accepted entry reads `Role: 30, InvitedRole: 0`
+ * and the invite cannot be answered twice. `role` is what the ACCEPTING PLAYER asked for, and
+ * it must equal the `InvitedRole` already on their entry. That equality is the whole security
+ * of this call: the answer is made by the invited player themselves, so without it they could
+ * answer an invite to Host by asking for Creator and award themselves the room. The invited
+ * role is the server's own record of what the owner offered, written by
+ * {@link inviteRoomRole}, and nothing the caller sends can move it.
+ *
+ * Declining (`role` 0 — not a real tier, so it can't be confused for one) REMOVES the entry
+ * outright rather than just clearing `InvitedRole`: a declined invite should leave the room's
+ * `Roles` as it was before the offer. Note that this takes any role the player already held
+ * with it, so someone re-invited to a different tier who declines is left with nothing at
+ * all. That is deliberate — an invite is answered as a whole — but it means a decline is not
+ * a no-op for an existing member.
+ *
+ * Returns null — changing nothing — when there is no entry for the account, no invite
+ * standing on it, or (when accepting) the requested role isn't the one offered. The three are
+ * deliberately one answer: a caller probing for a higher role learns only that it didn't work.
+ *
+ * `LastChangedByAccountId` is left alone rather than restamped with the accepter: it names
+ * who put this role on the entry, and that is the owner who offered it. The caller supplies
+ * the already-loaded room to avoid a re-read; the whole room JSON is rewritten.
+ */
+export async function answerRoomRoleInvite(
+	db: D1Database,
+	roomId: number,
+	accountId: number,
+	role: number,
+	room: Room
+): Promise<Room | null> {
+	const roles = roomRoles(room)
+	const index = roles.findIndex((r) => r.AccountId === accountId)
+	if (index === -1) return null
+
+	const entry = roles[index]
+	// `Role.None` is "nothing pending" — the resting state of every entry, and what an
+	// already-answered invite leaves behind, so neither answer can be replayed.
+	if (entry.InvitedRole === Role.None) return null
+
+	if (role === Role.None) {
+		roles.splice(index, 1)
+	} else if (entry.InvitedRole !== role) {
+		return null
+	} else {
+		entry.Role = entry.InvitedRole
+		entry.InvitedRole = Role.None
+	}
+
+	const updated: Room = { ...room, Roles: roles }
+	await db
+		.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1')
+		.bind(roomId, serializeRoom(updated))
+		.run()
+	return updated
+}
+
+/**
+ * INVITE an account to a room role — setting `InvitedRole` on their `Roles` entry (adding
+ * the entry when they have none) and stamping `LastChangedByAccountId` with the inviter.
+ *
+ * `InvitedRole` is the PENDING half of a role entry: an invited account holds it until
+ * they accept, at which point {@link answerRoomRoleInvite} promotes it to the real `Role`.
+ * So an entry added here starts at {@link Role.None} — no role yet, only an offer — and an
+ * account who already holds a role keeps it while a higher one is pending.
+ *
+ * Like {@link answerRoomRoleInvite}, the caller supplies the already-loaded room to
+ * avoid a re-read, and the whole room JSON is rewritten. Returns the updated room.
+ */
+export async function inviteRoomRole(
+	db: D1Database,
+	roomId: number,
+	targetAccountId: number,
+	invitedRole: number,
+	changedByAccountId: number,
+	room: Room
+): Promise<Room> {
+	const roles = roomRoles(room)
+	const existing = roles.find((r) => r.AccountId === targetAccountId)
+	if (existing) {
+		existing.InvitedRole = invitedRole
+		existing.LastChangedByAccountId = changedByAccountId
+	} else {
+		roles.push({
+			AccountId: targetAccountId,
+			Role: Role.None,
+			LastChangedByAccountId: changedByAccountId,
+			InvitedRole: invitedRole,
+		})
+	}
+	const updated: Room = { ...room, Roles: roles }
+	await db
+		.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1')
+		.bind(roomId, serializeRoom(updated))
+		.run()
+	return updated
+}
+
+/**
+ * Mutually-exclusive "main" room tags. The 2023 UI presents these as radio buttons, so
+ * toggling one on clears any other main tag. Compared case-insensitively.
+ *
+ * Only the TOGGLE body obeys this — the newer whole-set body says outright which tags the
+ * room has, and its genre is the `IsPrimaryGenre` flag rather than membership of this set.
+ */
+const MAIN_TAGS = new Set(['pvp', 'quest', 'game', 'hangout', 'art'])
+
+/**
+ * A tag's `Type` — the client's tag CATEGORY, echoed back as stored.
+ *
+ * `user` is what a player types or picks. `auto` is what the client derives about the room
+ * and posts as `autoTag` (`limitsv2`, `beta`). `derived` is this server's own (`rro`).
+ * A tag's category is orthogonal to whether it is the room's primary genre.
+ */
+export const RoomTagType = {
+	user: 0,
+	auto: 1,
+	derived: 2,
+} as const
+
+/**
+ * The tag changes ONE `PUT /rooms/{id}/tags` request asks for. Every field is optional and
+ * they compose: a single request may replace the user tags, add a derived one and move the
+ * genre, and it is applied as one write.
+ */
+export interface RoomTagEdit {
+	/**
+	 * The 2023 single-tag TOGGLE: the tag is added when the room lacks it and removed when
+	 * it has it, and adding one of {@link MAIN_TAGS} clears the others.
+	 */
+	toggle?: string
+	/**
+	 * The whole set of USER tags, replacing every `Type: 0` tag the room carries. The
+	 * derived tags (`auto`, `derived`) are not the client's to send and are left alone.
+	 */
+	tags?: string[]
+	/**
+	 * Tags to ensure present at `Type: 1`. Additive — nothing here removes an auto tag,
+	 * since the client posts the ones it wants rather than the full set. A tag already on
+	 * the room is re-categorised rather than duplicated.
+	 */
+	autoTags?: string[]
+	/**
+	 * The tag to flag as the room's genre. Added (as a user tag) when the room lacks it;
+	 * every other tag keeps its place and loses the flag.
+	 */
+	primaryGenre?: string
+}
+
+/** A tag's name, lowercased — every comparison in here is case-insensitive. */
+const tagKey = (t: RoomTag): string => String(t?.Tag).toLowerCase()
+
+/**
+ * Apply one request's worth of tag changes to a room and store the result. The caller
+ * supplies the already-loaded (owner-checked) room, so nothing is re-read.
+ *
+ * The changes are composed into ONE set and written once: a request naming tags, an auto
+ * tag and a genre is a single state for the room, and applying it in three writes would
+ * let a reader (or a failure) land between them.
+ *
+ * Only `room_tag` is written — the room blob carries no tags at all, so the room row is
+ * left alone.
+ */
+export async function applyRoomTagEdit(
+	db: D1Database,
+	roomId: number,
+	room: Room,
+	edit: RoomTagEdit
+): Promise<Room> {
+	const current = Array.isArray(room.Tags) ? (room.Tags as RoomTag[]) : []
+	// Copies throughout: the room handed in is answered to the client, and the steps below
+	// mutate what they build.
+	let next: RoomTag[] = current.map((t) => ({ ...t }))
+
+	if (edit.tags !== undefined) {
+		// A SET, not a merge. The posted list is exactly the room's user tags afterwards; a
+		// tag already there keeps its row (and its genre flag, until the genre step below
+		// says otherwise) rather than being deleted and re-added.
+		const posted = new Set(edit.tags.map((t) => t.toLowerCase()))
+		next = [
+			...next.filter((t) => t.Type !== RoomTagType.user && !posted.has(tagKey(t))),
+			...edit.tags.map(
+				(tag) =>
+					next.find((t) => tagKey(t) === tag.toLowerCase()) ?? { Tag: tag, Type: RoomTagType.user }
+			),
+		]
+	} else if (edit.toggle !== undefined) {
+		// The 2023 client has no delete/patch endpoint, so the same call toggles: remove the
+		// tag if present, add it otherwise. Adding a main tag is a radio pick, so it also
+		// clears any other main tag. Removing the flagged tag takes the genre with it, which
+		// is right — the room's genre WAS that tag.
+		const lower = edit.toggle.toLowerCase()
+		const existing = next.findIndex((t) => tagKey(t) === lower)
+		if (existing !== -1) {
+			next = next.filter((_, i) => i !== existing)
+		} else {
+			const kept = MAIN_TAGS.has(lower) ? next.filter((t) => !MAIN_TAGS.has(tagKey(t))) : next
+			next = [...kept, { Tag: edit.toggle, Type: RoomTagType.user }]
+		}
+	}
+
+	for (const auto of edit.autoTags ?? []) {
+		const existing = next.find((t) => tagKey(t) === auto.toLowerCase())
+		// A tag the room already carries is re-categorised in place rather than duplicated —
+		// `tag` is the table's key, so there is only ever one row per name anyway.
+		if (existing) existing.Type = RoomTagType.auto
+		else next.push({ Tag: auto, Type: RoomTagType.auto })
+	}
+
+	if (edit.primaryGenre !== undefined) {
+		const lower = edit.primaryGenre.toLowerCase()
+		for (const tag of next) delete tag.IsPrimaryGenre
+		const chosen = next.find((t) => tagKey(t) === lower)
+		// A tag the room already carries keeps its category and simply becomes the genre;
+		// one it doesn't is added as an ordinary user tag.
+		if (chosen) chosen.IsPrimaryGenre = true
+		else next.push({ Tag: edit.primaryGenre, Type: RoomTagType.user, IsPrimaryGenre: true })
+	}
+
+	return storeRoomTags(db, roomId, room, next)
+}
+
+/**
+ * Write a room's whole tag set and answer the room carrying it, lowercased the way the
+ * table holds it — so the caller replies with exactly what a re-read would give, without
+ * paying for the re-read. `IsPrimaryGenre` survives only where it was set, and stays
+ * absent (not false) everywhere else.
+ */
+async function storeRoomTags(
+	db: D1Database,
+	roomId: number,
+	room: Room,
+	tags: RoomTag[]
+): Promise<Room> {
+	await setRoomTags(db, roomId, tags)
+	return {
+		...room,
+		Tags: tags.map((t) => {
+			const stored: RoomTag = { Tag: t.Tag.toLowerCase(), Type: t.Type }
+			if (t.IsPrimaryGenre) stored.IsPrimaryGenre = true
+			return stored
+		}),
+	}
+}
+
+/** Find a subroom (by SubRoomId) inside an already-hydrated room's `SubRooms`, or undefined. */
+export function findSubRoom(room: Room, subRoomId: number): SubRoom | undefined {
+	const subRooms = Array.isArray(room.SubRooms) ? (room.SubRooms as SubRoom[]) : []
+	return subRooms.find((s) => s.SubRoomId === subRoomId)
+}
+
+/** Fields from the client's room-save POST body. */
+export interface SaveSubRoomDataInput {
+	/** Uploaded blob key for this subroom's scene data (becomes `CurrentSave.DataBlob`). */
+	subRoomDataFilename?: string
+	/** `SubRoomData.Hash` — echoed back as the save response's `dataBlobHash`. */
+	subRoomDataHash?: string
+	/**
+	 * `RoomData.Filename` — the uploaded ROOM-level metadata blob (a separate upload from the
+	 * scene). It lands on the ROOM as `DataBlob`, not on the subroom: the client's `Room` has
+	 * `DataBlob`/`DataBlobHash` and its `SubRoom` has no field for it (`RoomDataBlob`, where
+	 * this once went, is not a key the client knows, and it dropped it silently).
+	 */
+	roomDataFilename?: string
+	/** `RoomData.Hash` — stored beside it as the room's `DataBlobHash`; null when unsent. */
+	roomDataHash?: string
+	/**
+	 * The save comment — a description of THIS revision, typed into the client's save box.
+	 * It belongs to the save (and shows up in the `…/saves` history); it is not the room's
+	 * public description, which only `PUT /rooms/:id/description` sets.
+	 */
+	description?: string
+	persistenceVersion?: number
+	inventionUsage?: string
+	/** Optional baked-asset id; emitted on the save only when present. */
+	unityAssetId?: string
+	/**
+	 * The client's `AutoPublish`. True publishes the save outright (the author wants it
+	 * live now); false/absent stages it for a manual `publish_save`. Dorms ignore this and
+	 * always publish.
+	 */
+	autoPublish?: boolean
+}
+
+/**
+ * A subroom's `CurrentSave` — the `SubRoomDataSave` the client reads to find the scene
+ * data blob to download. The loader looks ONLY here: a subroom with no `CurrentSave`
+ * loads nothing, no matter what the (legacy, flat) `DataBlob` field says.
+ */
+export type SubRoomDataSave = Record<string, unknown>
+
+/**
+ * The scene-data blob key the client should download for a subroom. Prefers the
+ * authoritative `CurrentSave.DataBlob` and falls back to the flat `DataBlob` that
+ * subrooms written before `CurrentSave` existed (and the `0001_init.sql` dorm seed)
+ * still carry. Shared so the `match` and `auth` room-instance payloads resolve the
+ * blob the same way the client's own loader does.
+ */
+export function subRoomDataBlob(sub: SubRoom | undefined | null): string {
+	const save = sub?.CurrentSave
+	if (save && typeof save === 'object') {
+		const blob = (save as SubRoomDataSave).DataBlob
+		if (typeof blob === 'string' && blob !== '') return blob
+	}
+	return typeof sub?.DataBlob === 'string' ? sub.DataBlob : ''
+}
+
+/** Fields that vary between a real save and one reconstructed from the legacy shape. */
+interface BuildSaveInput {
+	subRoomId: unknown
+	dataBlob: string
+	dataBlobHash: string | null
+	persistenceVersion: number
+	savedByAccountId: unknown
+	description: string
+	createdAt: string
+	unityAssetId?: string
+}
+
+/**
+ * Build a `SubRoomDataSave` in the shape the client parses — the reference's `MapSave`
+ * projection. The array fields start empty and must be PRESENT. `UnitySubAssets` is
+ * filled in on read when this save's `UnityAssetId` has stored Studio bundles (see
+ * {@link attachStudioUnityAssets}); referenced assets stay empty. `UnityAssetId` is
+ * emitted only when the save actually carried one, exactly as the reference does.
+ * There is deliberately no `DataBlobHash` of our own: the caller stores the hash the
+ * client sent, and a save that carried none keeps it null.
+ *
+ * `SavedOnPlatform`/`SavedOnDeviceClass` are 0 — the reference fills them from the saving
+ * player's live platform/device, which the save request doesn't carry and we don't track.
+ *
+ * Shared by the save path and the legacy-shape reconstruction so the two can't drift.
+ */
+function buildSubRoomSave(input: BuildSaveInput): SubRoomDataSave {
+	const save: SubRoomDataSave = {
+		UnitySubAssets: [],
+		ReferencedUnityAssets: [],
+		SubRoomId: input.subRoomId,
+		DataBlob: input.dataBlob,
+		// The client sends `SubRoomData.Hash` (usually null); the room-save response echoes
+		// it as `dataBlobHash`. One observed room payload carries it on `CurrentSave` and
+		// another omits it, so storing it and letting it ride along is the safe reading.
+		DataBlobHash: input.dataBlobHash,
+		ReferencedUnityAssetIds: [],
+		PersistenceVersion: input.persistenceVersion,
+		OMVersion: 0,
+		UgcSubVersion: 0,
+		SavedByAccountId: input.savedByAccountId,
+		SavedOnPlatform: 0,
+		SavedOnDeviceClass: 0,
+		Description: input.description,
+		Tags: [],
+		ModerationState: 0,
+		CreatedAt: input.createdAt,
+	}
+	if (input.unityAssetId) save.UnityAssetId = input.unityAssetId
+	return save
+}
+
+/**
+ * Build a save row from a subroom stored in the pre-`CurrentSave` shape, where the blob
+ * key sat in the flat `DataBlob`/`DataSavedAt`/`PersistenceVersion` fields. Those
+ * subrooms hold real saved content the client cannot see (it reads `CurrentSave` only),
+ * so they get a save of their own rather than reading as never-saved. Mirrors backfill 2
+ * of migration 0008 — keep the two in sync.
+ *
+ * Returns null when there is genuinely nothing saved, the honest answer for a fresh
+ * subroom.
+ */
+function legacySubRoomSave(sub: SubRoom): SubRoomDataSave | null {
+	const blob = sub.DataBlob
+	if (typeof blob !== 'string' || blob === '') return null
+	const savedAt = typeof sub.DataSavedAt === 'string' ? sub.DataSavedAt : new Date(0).toISOString()
+	return buildSubRoomSave({
+		subRoomId: sub.SubRoomId,
+		dataBlob: blob,
+		dataBlobHash: null,
+		persistenceVersion: typeof sub.PersistenceVersion === 'number' ? sub.PersistenceVersion : 0,
+		// The legacy shape never recorded who saved; the subroom's creator is the best
+		// available answer (the save path is owner/co-owner gated).
+		savedByAccountId: sub.CreatorAccountId ?? null,
+		description: '',
+		createdAt: savedAt,
+	})
+}
+
+/**
+ * The invention ids inside a room save's `InventionUsage`, in the order it lists them.
+ *
+ * The value is a base64 PROTOBUF message, recovered by reading real saves — there is no
+ * schema, only field numbers:
+ *
+ *   1: varint            — 1 on every save seen; a format version by the look of it
+ *   2: repeated message  — one per invention in the scene
+ *        1: varint       — the invention id
+ *        2: varint       — 1 on every save seen; probably how many times it is placed
+ *
+ * `CAESBgil2gEQARIFCIECEAE=` is `{ 1: 1, 2: [{ 1: 27941, 2: 1 }, { 1: 257, 2: 1 }] }`.
+ *
+ * Only the ids are read. Anything that doesn't parse — not base64, a truncated message, a
+ * wire type this doesn't know — yields the ids found up to that point rather than
+ * throwing: this is bookkeeping riding on a room save, and a format the client changes
+ * must not be able to fail the save.
+ */
+export function decodeInventionUsage(inventionUsage: string): number[] {
+	let bytes: Uint8Array
+	try {
+		bytes = Uint8Array.from(atob(inventionUsage), (ch) => ch.charCodeAt(0))
+	} catch {
+		return []
+	}
+
+	/** Walk one message's fields; false from `visit`, or anything malformed, stops the walk. */
+	const walk = (
+		buf: Uint8Array,
+		visit: (field: number, value: number | Uint8Array) => void
+	): void => {
+		let at = 0
+		const varint = (): number | null => {
+			let value = 0
+			for (let shift = 0; at < buf.length; shift += 7) {
+				const byte = buf[at++]
+				// Multiplication, not `<<`: ids past 2^31 would wrap as a 32-bit shift.
+				value += (byte & 0x7f) * 2 ** shift
+				if ((byte & 0x80) === 0) return value
+			}
+			return null
+		}
+		while (at < buf.length) {
+			const key = varint()
+			if (key === null) return
+			const field = Math.floor(key / 8)
+			const wireType = key % 8
+			if (wireType === 0) {
+				const value = varint()
+				if (value === null) return
+				visit(field, value)
+			} else if (wireType === 2) {
+				const length = varint()
+				if (length === null || at + length > buf.length) return
+				visit(field, buf.subarray(at, at + length))
+				at += length
+			} else {
+				return
+			}
+		}
+	}
+
+	const ids: number[] = []
+	walk(bytes, (field, entry) => {
+		if (field !== 2 || typeof entry === 'number') return
+		walk(entry, (inner, value) => {
+			if (inner === 1 && typeof value === 'number' && Number.isSafeInteger(value)) ids.push(value)
+		})
+	})
+	return ids
+}
+
+/**
+ * Re-derive a room's `room_invention` rows from its subrooms: the union of the inventions
+ * each subroom's last save reported in `InventionUsage`. An invention removed from the room
+ * drops out on the next save — and the set is derived from EVERY subroom rather than the
+ * one just saved, because the table is per room and a save of one subroom says nothing
+ * about what the others still hold.
+ *
+ * A subroom's `InventionUsage` is whatever its latest save sent, staged or published, so
+ * this is the room as its builders last left it, not strictly what players are loading.
+ *
+ * Every invention that entered or left the room then has its `NumPlayersHaveUsedInRoom`
+ * resynced — the number of ROOMS it is in, which is what this server has to put behind
+ * that field. Derived from the table, like `CheerCount` and `NumDownloads` from theirs, and
+ * a `json_set` on the one key of the `invention` record (the `api` worker's table, same
+ * database). Only the rows that changed are written, so the usual save — same inventions
+ * as last time — costs one read.
+ */
+export async function syncRoomInventions(
+	db: D1Database,
+	roomId: number,
+	room: Room
+): Promise<void> {
+	const subRooms = Array.isArray(room.SubRooms) ? (room.SubRooms as SubRoom[]) : []
+	const now = new Set<number>()
+	for (const sub of subRooms) {
+		if (typeof sub.InventionUsage !== 'string') continue
+		for (const id of decodeInventionUsage(sub.InventionUsage)) now.add(id)
+	}
+
+	const { results } = await db
+		.prepare('SELECT invention_id FROM room_invention WHERE room_id = ?1')
+		.bind(roomId)
+		.all<{ invention_id: number }>()
+	const before = new Set(results.map((r) => r.invention_id))
+	const added = [...now].filter((id) => !before.has(id))
+	const removed = [...before].filter((id) => !now.has(id))
+	if (added.length === 0 && removed.length === 0) return
+
+	// One batch, in order: the membership changes land before the counts are re-derived.
+	await db.batch([
+		...removed.map((id) =>
+			db
+				.prepare('DELETE FROM room_invention WHERE room_id = ?1 AND invention_id = ?2')
+				.bind(roomId, id)
+		),
+		...added.map((id) =>
+			db
+				.prepare('INSERT OR IGNORE INTO room_invention (room_id, invention_id) VALUES (?1, ?2)')
+				.bind(roomId, id)
+		),
+		...[...added, ...removed].map((id) =>
+			db
+				.prepare(
+					`UPDATE invention SET data = json_set(data, '$.NumPlayersHaveUsedInRoom',
+						(SELECT COUNT(*) FROM room_invention WHERE invention_id = ?1))
+					 WHERE id = ?1`
+				)
+				.bind(id)
+		),
+	])
+}
+
+/** How many rooms an invention is used in — the stat `room_invention` exists to answer. */
+export async function countRoomsUsingInvention(
+	db: D1Database,
+	inventionId: number
+): Promise<number> {
+	const row = await db
+		.prepare('SELECT COUNT(*) AS n FROM room_invention WHERE invention_id = ?1')
+		.bind(inventionId)
+		.first<{ n: number }>()
+	return row?.n ?? 0
+}
+
+/**
+ * Persist a room-save against a specific subroom. Everything the save carries belongs to
+ * that subroom's revision — nothing is written to the room. Returns the updated
+ * (hydrated) room AND the save that was just created — the route answers with both — or
+ * null when the room or subroom doesn't exist.
+ *
+ * Whether the save goes live is the client's call: `AutoPublish: true` publishes it
+ * outright, otherwise it becomes the subroom's `staged_save_id` with the live
+ * `current_save_id` untouched, so what players load doesn't change until the room's
+ * creator publishes (see {@link publishSubRoomSave}). Dorms always publish — they have
+ * no publish flow in the client.
+ */
+export async function saveSubRoomData(
+	db: D1Database,
+	roomId: number,
+	subRoomId: number,
+	accountId: number,
+	input: SaveSubRoomDataInput
+): Promise<{ room: Room; save: SubRoomDataSave } | null> {
+	const room = await getRoomById(db, roomId)
+	if (!room) return null
+	// Read off the already-hydrated room rather than re-querying the subroom and its
+	// save — getRoomById has both, and this path is write-heavy enough already.
+	const sub = findSubRoom(room, subRoomId)
+	if (!sub) return null
+
+	// Populate the subroom's creator on first save — it starts null, and the
+	// client NREs on a null CreatorAccountId. Only the owner reaches this path.
+	if (sub.CreatorAccountId == null) sub.CreatorAccountId = accountId
+
+	// Append a new save row. The blob the loader downloads lives on the save — a subroom
+	// whose current_save_id resolves to nothing loads nothing — so this never touches the
+	// flat DataBlob field. Previous saves stay in the table as history.
+	//
+	// A staged save carries forward from the previous STAGED one when there is one, so a
+	// creator's second edit builds on their first rather than on what's live.
+	const staged =
+		typeof sub.StagedSubRoomDataSaveId === 'number'
+			? await getSubRoomSaveById(db, subRoomId, sub.StagedSubRoomDataSaveId)
+			: null
+	const previous =
+		staged ??
+		(sub.CurrentSave && typeof sub.CurrentSave === 'object'
+			? (sub.CurrentSave as SubRoomDataSave)
+			: undefined)
+	const priorVersion = previous?.PersistenceVersion
+	const priorBlob = previous?.DataBlob
+	const save = await insertSubRoomSave(
+		db,
+		subRoomId,
+		buildSubRoomSave({
+			subRoomId,
+			// A save that carries no new blob (e.g. a description-only save) keeps the one
+			// the subroom already loads from.
+			dataBlob: input.subRoomDataFilename ?? (typeof priorBlob === 'string' ? priorBlob : ''),
+			dataBlobHash: input.subRoomDataHash ?? null,
+			persistenceVersion:
+				input.persistenceVersion ?? (typeof priorVersion === 'number' ? priorVersion : 0),
+			savedByAccountId: accountId,
+			// The save comment — empty string, not null, when the save carries none (the
+			// reference's `roomDesc ?? ""`).
+			description: input.description ?? '',
+			createdAt: new Date().toISOString(),
+			unityAssetId: input.unityAssetId,
+		})
+	)
+	const saveId = Number(save.SubRoomDataSaveId)
+	sub.DataSavedAt = new Date().toISOString()
+	if (input.persistenceVersion !== undefined) sub.PersistenceVersion = input.persistenceVersion
+	if (input.inventionUsage !== undefined) sub.InventionUsage = input.inventionUsage
+
+	// The ONE thing a save writes on the ROOM: `RoomData`, the room-level metadata blob the
+	// client uploads beside the scene. The client's `Room` reads it as `DataBlob` (with
+	// `DataBlobHash`), so that is where it goes — a targeted `json_set` of those two keys,
+	// never a rewrite of the room row. It used to be put on the subroom as `RoomDataBlob`,
+	// which the client has no field for, so no save ever reached it.
+	//
+	// Everything else the save carries describes the SUBROOM's revision: `Description` is the
+	// save comment shown in the `…/saves` history, `PersistenceVersion` and `InventionUsage`
+	// describe the scene just saved. They used to be copied onto the room as well, which
+	// meant each save silently replaced the room's public description with the save comment.
+	// The room's own fields are edited through their own routes (`PUT /rooms/:id/description`
+	// and friends).
+	const roomWrites: D1PreparedStatement[] = []
+	if (input.roomDataFilename) {
+		const hash = input.roomDataHash ?? null
+		room.DataBlob = input.roomDataFilename
+		room.DataBlobHash = hash
+		roomWrites.push(
+			db
+				.prepare(
+					"UPDATE room SET data = json_set(data, '$.DataBlob', ?2, '$.DataBlobHash', ?3) WHERE room_id = ?1"
+				)
+				.bind(roomId, input.roomDataFilename, hash)
+		)
+	}
+
+	// Publish outright when the client asked to (`AutoPublish`), or for a dorm — a dorm is
+	// the player's own private space with no publish step in the client, so staging one
+	// would leave their edits permanently invisible. Otherwise stage it and wait for
+	// `publish_save`. One round trip for the rest of the save.
+	const publishNow = input.autoPublish === true || room.IsDorm === true
+	await db.batch([
+		...roomWrites,
+		publishNow
+			? db
+					.prepare(
+						'UPDATE subroom SET current_save_id = ?2, staged_save_id = NULL WHERE sub_room_id = ?1'
+					)
+					.bind(subRoomId, saveId)
+			: db
+					.prepare('UPDATE subroom SET staged_save_id = ?2 WHERE sub_room_id = ?1')
+					.bind(subRoomId, saveId),
+		db
+			.prepare('UPDATE subroom SET data = ?2 WHERE sub_room_id = ?1')
+			.bind(subRoomId, serializeSubRoom(sub, roomId)),
+	])
+
+	// Re-hydrate so the returned room reflects the just-saved subroom.
+	await attachSubRooms(db, [room])
+	// The one thing a save records OUTSIDE the subroom and its save row: which inventions
+	// the room now has in it. Its own table, so the room row is still not rewritten.
+	await syncRoomInventions(db, roomId, room)
+	return { room, save }
+}
+
+/**
+ * Publish one of a subroom's saves by id: make it the `current_save_id` players load.
+ * This is the manual step every non-dorm room save waits on ({@link saveSubRoomData}
+ * only stages). Because it takes an explicit id it doubles as restore-a-save — the id
+ * can be any save in the subroom's history, not just the staged one.
+ *
+ * The staging slot is cleared only when the save being published IS the staged one, so
+ * restoring an older version doesn't silently discard newer unpublished work.
+ *
+ * The id is looked up scoped to the subroom, so one subroom can't publish another's save
+ * (ids are globally unique, so an unscoped lookup would happily resolve).
+ *
+ * Returns the updated (hydrated) room, or a reason: `not_found` (no such room/subroom) /
+ * `unknown_save` (no such save on this subroom).
+ */
+export async function publishSubRoomSave(
+	db: D1Database,
+	roomId: number,
+	subRoomId: number,
+	saveId: number
+): Promise<{ ok: true; room: Room } | { ok: false; reason: 'not_found' | 'unknown_save' }> {
+	const sub = await getSubRoom(db, roomId, subRoomId)
+	if (!sub) return { ok: false, reason: 'not_found' }
+	if (!(await getSubRoomSaveById(db, subRoomId, saveId))) {
+		return { ok: false, reason: 'unknown_save' }
+	}
+
+	await db
+		.prepare(
+			`UPDATE subroom SET current_save_id = ?2,
+			   staged_save_id = CASE WHEN staged_save_id = ?2 THEN NULL ELSE staged_save_id END
+			 WHERE sub_room_id = ?1`
+		)
+		.bind(subRoomId, saveId)
+		.run()
+
+	const room = await getRoomById(db, roomId)
+	if (!room) return { ok: false, reason: 'not_found' }
+	return { ok: true, room }
+}
+
+/** Fields from the client's subroom `modify` form (each applied only when supplied). */
+export interface ModifySubRoomInput {
+	name?: string
+	accessibility?: number
+	maxPlayers?: number
+}
+
+/**
+ * Modify a subroom's settings in place — its Name, Accessibility, and MaxPlayers
+ * (the fields the client's subroom `modify` form carries). Only the supplied fields
+ * are changed; the subroom row is updated in the `subroom` table. Returns the updated
+ * (hydrated) room, or null when the room or subroom doesn't exist.
+ *
+ * A changed `MaxPlayers` is pushed onto the subroom's LIVE instances too (see
+ * {@link resyncInstanceCapacity}): each instance carries a copy of the cap it enforces,
+ * and this is the write that makes that copy stale.
+ */
+export async function modifySubRoom(
+	db: D1Database,
+	roomId: number,
+	subRoomId: number,
+	input: ModifySubRoomInput
+): Promise<Room | null> {
+	const sub = await getSubRoom(db, roomId, subRoomId)
+	if (!sub) return null
+
+	if (input.name !== undefined) sub.Name = input.name
+	if (input.accessibility !== undefined) sub.Accessibility = input.accessibility
+	const capacityChanged = input.maxPlayers !== undefined && input.maxPlayers !== sub.MaxPlayers
+	if (input.maxPlayers !== undefined) sub.MaxPlayers = input.maxPlayers
+	await updateSubRoom(db, sub)
+	if (capacityChanged) await resyncInstanceCapacity(db, roomId, subRoomId, input.maxPlayers!)
+
+	return getRoomById(db, roomId)
+}
+
+/**
+ * Clone an existing subroom into a new subroom of the same room, owned by
+ * `accountId`. The copy keeps the source's scene/settings (and its saved data
+ * blobs, so it loads identical content) but gets a fresh globally-unique SubRoomId
+ * minted from the `subroom` table's autoincrement sequence. Returns the updated
+ * (hydrated) room and the new subroom, or null when the room or source subroom
+ * doesn't exist.
+ */
+export async function cloneSubRoom(
+	db: D1Database,
+	roomId: number,
+	subRoomId: number,
+	accountId: number
+): Promise<{ room: Room; subRoom: SubRoom } | null> {
+	const source = await getSubRoom(db, roomId, subRoomId)
+	if (!source) return null
+
+	const subRoom = await insertSubRoom(db, roomId, { ...source, CreatorAccountId: accountId })
+	const room = await getRoomById(db, roomId)
+	if (!room) return null
+	return { room, subRoom }
+}
+
+/** Fallback scene, used only when a room has no existing subroom to inherit from. */
+const DEFAULT_SUBROOM_SCENE = '76d98498-60a1-430c-ab76-b54a29b7a163'
+
+/**
+ * The scene a brand-new subroom inherits: the room's own first (existing) subroom —
+ * lowest SubRoomId — read from the subroom table. Falls back to the base sandbox scene
+ * only when the room has no subrooms yet.
+ */
+async function baseSubRoomScene(db: D1Database, roomId: number): Promise<string> {
+	const row = await db
+		.prepare('SELECT data FROM subroom WHERE room_id = ?1 ORDER BY sub_room_id LIMIT 1')
+		.bind(roomId)
+		.first<{ data: string }>()
+	const scene = row ? (JSON.parse(row.data) as SubRoom).UnitySceneId : undefined
+	return typeof scene === 'string' ? scene : DEFAULT_SUBROOM_SCENE
+}
+
+/**
+ * Create a new (empty) subroom in a room, owned by `accountId` and named `name`. It
+ * inherits the room's existing subroom scene (see {@link baseSubRoomScene}) with a clean
+ * save, and gets a fresh globally-unique SubRoomId. Returns the updated (hydrated) room
+ * and the new subroom, or null when the room doesn't exist.
+ */
+export async function createSubRoom(
+	db: D1Database,
+	roomId: number,
+	accountId: number,
+	name: string
+): Promise<{ room: Room; subRoom: SubRoom } | null> {
+	const room = await getRoomById(db, roomId)
+	if (!room) return null
+
+	const subRoom = await insertSubRoom(db, roomId, {
+		Name: name,
+		CreatorAccountId: accountId,
+		UnitySceneId: await baseSubRoomScene(db, roomId),
+		MaxPlayers: 4,
+		Accessibility: Accessibility.Unlisted,
+		IsSandbox: true,
+		LastModeratedSaveModerationState: 0,
+		ShouldAutoStageSaves: true,
+		// Nothing saved yet — the first room save mints one and points current_save_id
+		// at it. Until then the subroom reads with `CurrentSave: null`.
+	})
+	// Refresh the hydrated SubRooms so the returned room includes the one just inserted.
 	await attachSubRooms(db, [room])
 	return { room, subRoom }
 }
