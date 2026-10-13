@@ -1284,6 +1284,64 @@ describe('public endpoints', () => {
 		expect(res.status).toBe(200)
 	})
 
+	// The 2026 client posts its VR locomotion here. It's presence state (the heartbeat
+	// echoes it), not a playersettings key.
+	test('PUT /player/vrmovementmode stores the mode on presence', async () => {
+		const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+		const headers = await bearer('9210', '20260323.14')
+		await setPresence(env.DB, {
+			accountId: 9210,
+			roomInstance: null,
+			statusVisibility: 0,
+			deviceClass: 0,
+			vrMovementMode: 1,
+			platform: 0,
+			appVersion: '20260323.14',
+		})
+		const update = async (body: string, contentType: string) =>
+			exports.default.fetch(`${ORIGIN}/player/vrmovementmode`, {
+				method: 'PUT',
+				headers: { ...headers, 'Content-Type': contentType },
+				body,
+			})
+		const heartbeat = async () =>
+			(
+				await exports.default.fetch(`${ORIGIN}/player/heartbeat`, { method: 'POST', headers })
+			).json()
+
+		expect((await update('vrMovementMode=2', 'application/x-www-form-urlencoded')).status).toBe(200)
+		expect(await heartbeat()).toMatchObject({ vrMovementMode: 2 })
+
+		// JSON forms too, and the other presence fields are left alone.
+		await update(JSON.stringify({ VrMovementMode: 0 }), 'application/json')
+		expect(await heartbeat()).toMatchObject({ vrMovementMode: 0, statusVisibility: 0 })
+
+		// Junk and negatives are ignored rather than stored.
+		await update('vrMovementMode=walk', 'application/x-www-form-urlencoded')
+		await update('vrMovementMode=-1', 'application/x-www-form-urlencoded')
+		expect(await heartbeat()).toMatchObject({ vrMovementMode: 0 })
+
+		// The player's own cached presence is refreshed; nobody else is told.
+		const sent = await (
+			await hub().fetch('http://do/all')
+		).json<Array<{ playerIds: number[]; data: { vrMovementMode: number } }>>()
+		expect(sent).toHaveLength(2)
+		expect(sent[0]).toMatchObject({ playerIds: [9210], data: { vrMovementMode: 2 } })
+		expect(sent[1]).toMatchObject({ playerIds: [9210], data: { vrMovementMode: 0 } })
+	})
+
+	test('PUT /player/vrmovementmode without a token or presence returns 200', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/player/vrmovementmode`, { method: 'PUT' })
+		expect(res.status).toBe(200)
+		const authed = await exports.default.fetch(`${ORIGIN}/player/vrmovementmode`, {
+			method: 'PUT',
+			headers: { ...(await bearer('9211')), 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: 'vrMovementMode=1',
+		})
+		expect(authed.status).toBe(200)
+	})
+
 	test('GET /player/connection-info 401s without a token', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/player/connection-info`)
 		expect(res.status).toBe(401)
@@ -4062,6 +4120,7 @@ describe('auth-gated endpoints', () => {
 			'PUT /player/gameserverregionpings',
 			'PUT /player/photonregionpings',
 			'PUT /player/statusvisibility',
+			'PUT /player/vrmovementmode',
 			'PUT /roominstance/{id}/inprogress',
 			'PUT /roominstance/{id}/matchpolicy',
 		])

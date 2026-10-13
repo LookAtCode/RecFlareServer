@@ -289,6 +289,16 @@ export const StatusVisibilityRequest = z.object({
 })
 
 /**
+ * `PUT /player/vrmovementmode` form body — `vrMovementMode=1`, posted by the 2026 client
+ * when the player changes their VR locomotion. The value is the client's `VRMovementMode`
+ * enum ordinal: 0 teleport, 1 walk (the only one seen on the wire). The server stores any
+ * non-negative integer rather than betting on the enum's size.
+ */
+export const VrMovementModeRequest = z.object({
+	vrMovementMode: z.string().describe('Integer string: 0 teleport, 1 walk; non-numeric is ignored'),
+})
+
+/**
  * `POST /player/notifydisconnect` form body — posted by Photon when it sees a player
  * drop a room instance. Both fields are integer strings.
  */

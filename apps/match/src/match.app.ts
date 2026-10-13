@@ -101,6 +101,7 @@ import {
 	RoomInstanceSummaryDto,
 	StatusVisibilityRequest,
 	UNAUTHORIZED_RESPONSE,
+	VrMovementModeRequest,
 } from './openapi'
 
 import type { Context } from 'hono'
@@ -502,6 +503,30 @@ async function readAvoidJuniorsBody(c: Context<App>): Promise<boolean | undefine
 
 	const key = findAvoidJuniorsKey(body as Record<string, unknown>)
 	return key === undefined ? undefined : parseSettingBool((body as Record<string, unknown>)[key])
+}
+
+/**
+ * A non-negative integer the client posted under `field` — the shape of every presence
+ * status setter (`PUT /player/statusvisibility`, `PUT /player/vrmovementmode`). The
+ * client sends a form (`statusVisibility=2`); a query string, a JSON object keyed either
+ * way (`statusVisibility`/`StatusVisibility`), and a bare JSON number are accepted too.
+ * `NaN` when nothing readable was posted, so the caller can leave the row alone.
+ */
+async function readPostedInt(c: Context<App>, field: string): Promise<number> {
+	const body: unknown = c.req.header('content-type')?.includes('application/json')
+		? await c.req.json().catch(() => null)
+		: await c.req.parseBody().catch(() => null)
+	const pascal = field[0].toUpperCase() + field.slice(1)
+	const value =
+		c.req.query(field) ??
+		(body && typeof body === 'object'
+			? ((body as Record<string, unknown>)[field] ?? (body as Record<string, unknown>)[pascal])
+			: body)
+	return typeof value === 'number'
+		? value
+		: typeof value === 'string' && /^\d+$/.test(value)
+			? Number(value)
+			: NaN
 }
 
 /** A synthesized room instance (same shape for dorm and other rooms). */
@@ -2115,22 +2140,7 @@ const app = new Hono<App>()
 		async (c) => {
 			const id = await authedId(c)
 			if (id !== null) {
-				// Accept native form/query enum values and JSON integrations.
-				const body: unknown = c.req.header('content-type')?.includes('application/json')
-					? await c.req.json().catch(() => null)
-					: await c.req.parseBody().catch(() => null)
-				const value =
-					c.req.query('statusVisibility') ??
-					(body && typeof body === 'object'
-						? ((body as Record<string, unknown>).statusVisibility ??
-							(body as Record<string, unknown>).StatusVisibility)
-						: body)
-				const sv =
-					typeof value === 'number'
-						? value
-						: typeof value === 'string' && /^\d+$/.test(value)
-							? Number(value)
-							: NaN
+				const sv = await readPostedInt(c, 'statusVisibility')
 				const presence = await getPresence<RoomInstance>(c.env.DB, id)
 				if (presence && Number.isInteger(sv) && sv >= 0 && sv <= 3) {
 					presence.statusVisibility = sv
@@ -2150,6 +2160,52 @@ const app = new Hono<App>()
 						})
 					}
 					await notifyFriendsPresence(c.env, id)
+				}
+			}
+			return c.body(null, 200)
+		}
+	)
+
+	// The player's VR locomotion mode. It is PRESENCE state, not a `playersettings` key:
+	// every presence payload already carries `vrMovementMode` (the reference keeps it on
+	// its player-state row beside `statusVisibility`), and matchmaking reads it to refuse a
+	// room whose owner doesn't support the mode (result 32). The 2026 client posts it here
+	// when the player changes locomotion: `vrMovementMode=1` is walk, 0 teleport. Friends aren't told — the
+	// field is blanked to 0 in the presence frame they get anyway.
+	.put(
+		'/player/vrmovementmode',
+		describeRoute({
+			tags: ['Presence'],
+			summary: 'Set VR movement mode',
+			description: [
+				'Updates the stored presence’s `vrMovementMode`, which the heartbeat and the',
+				'`/player` lookups then echo. No-op when the player has no live presence, the value',
+				'isn’t a non-negative integer, or the token is missing/invalid — always acks 200.',
+			].join(' '),
+			requestBody: form(VrMovementModeRequest, 'The vrMovementMode value'),
+			responses: { 200: EMPTY_OK },
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id !== null) {
+				const mode = await readPostedInt(c, 'vrMovementMode')
+				const presence = await getPresence<RoomInstance>(c.env.DB, id)
+				if (presence && Number.isInteger(mode) && mode >= 0 && presence.vrMovementMode !== mode) {
+					presence.vrMovementMode = mode
+					await setPresence(c.env.DB, presence)
+					// Refresh the client's cached own-player presence, as statusvisibility does.
+					try {
+						await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayersEphemeral(
+							[id],
+							NotificationType.SubscriptionUpdatePresence,
+							playerPayload(id, presence)
+						)
+					} catch (error) {
+						logger.error('failed to push own movement mode update', {
+							playerId: id,
+							error: String(error),
+						})
+					}
 				}
 			}
 			return c.body(null, 200)
